@@ -35,7 +35,7 @@ jobs:
       contents: read
     steps:
       - name: Check out the scanner (this repository)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
