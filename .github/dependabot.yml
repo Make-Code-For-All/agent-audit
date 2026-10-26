@@ -1,0 +1,11 @@
+# Weekly pull requests that update the workflow's actions and the pinned scan tools.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "pip"
+    directory: "/scripts"
+    schedule:
+      interval: "weekly"

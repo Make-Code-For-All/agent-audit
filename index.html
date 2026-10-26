@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' https://challenges.cloudflare.com; style-src 'self'; connect-src https://api.github.com https://raw.githubusercontent.com https://api.osv.dev https://*.workers.dev; frame-src https://challenges.cloudflare.com; base-uri 'none'; form-action 'none'">
+<title>Agent Audit: quick repository scanner</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<main>
+  <header>
+    <h1>Agent Audit</h1>
+    <p class="lede">Paste a public GitHub repository. This page reads its files without ever running them, then reports risky code patterns, suspicious dependencies and repository red flags.</p>
+  </header>
+
+  <section class="panel" aria-labelledby="scan-title">
+    <form id="scan-form" autocomplete="off">
+      <label id="scan-title" for="repo">Repository</label>
+      <div class="row">
+        <div class="grow"><input type="text" id="repo" placeholder="https://github.com/owner/name" spellcheck="false" autocapitalize="off" required></div>
+        <button class="primary" type="submit" id="go">Scan repository</button>
+        <button class="ghost" type="button" id="cancel" hidden>Cancel</button>
+      </div>
+      <p class="hint">Public repositories only. Files are fetched from GitHub and analysed in your browser; nothing is sent to any server of ours.</p>
+      <label class="check" for="deep" id="deep-row" hidden>
+        <input type="checkbox" id="deep" checked>
+        <span>Also run the deep scan
+          <small>Adds Semgrep, secret detection and dependency audits, run in the background on GitHub. Takes a few minutes.</small></span>
+      </label>
+      <div id="ts-box"></div>
+      <details class="opt">
+        <summary>Optional settings</summary>
+        <div class="opt-body">
+          <div>
+            <label for="ref">Branch, tag or commit</label>
+            <input type="text" id="ref" placeholder="Leave empty for the default branch" spellcheck="false" autocapitalize="off">
+          </div>
+          <div>
+            <label for="token">GitHub token</label>
+            <input type="password" id="token" placeholder="Optional" autocomplete="off" spellcheck="false">
+            <p class="hint">Only useful if you scan many repositories: it raises GitHub’s limit for the quick scan from 60 to 5,000 requests per hour. Use a token with no permissions. It is kept in memory, sent only to api.github.com, and cleared when you reload the page. The deep scan never needs it.</p>
+          </div>
+        </div>
+      </details>
+    </form>
+    <div id="status" aria-live="polite" hidden>
+      <ul id="log"></ul>
+      <p id="progress"></p>
+    </div>
+  </section>
+
+  <section id="out" hidden></section>
+
+  <h2>What this scan can and cannot tell you</h2>
+  <ul class="notes">
+    <li>It looks for known risky patterns: dynamic code execution, download-and-run commands, credential file access, exfiltration endpoints, persistence tricks, obfuscation, hidden characters and text aimed at AI reviewers.</li>
+    <li>It checks npm and PyPI dependencies in <span class="mono">package.json</span> and <span class="mono">requirements*.txt</span> against the OSV.dev database, including its list of known malicious packages, and flags names that look like typos of popular packages.</li>
+    <li>It cannot see code that is downloaded after install, payloads that activate later, or heavily obfuscated logic. A clean result means nothing was found, not that the repository is safe.</li>
+    <li>The deep scan runs Semgrep, secret detection and dependency audits on GitHub’s servers, still without executing the repository’s code. The repository link and commit are sent to this site’s scan service, and results are kept for 24 hours and then deleted.</li>
+    <li>Everything in the scanned repository is treated as hostile text. It is displayed as plain text only and never executed or interpreted.</li>
+  </ul>
+</main>
+
+<script src="config.js"></script>
+<script src="rules.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,116 @@
+# Deep scan: static analysis of a public GitHub repository, run on GitHub's servers.
+# The scanner API (the Cloudflare Worker) starts this workflow for visitors. You can also
+# start it by hand from the Actions tab. The target repository's code is only ever read,
+# never run, and the job that reads it has no secrets.
+
+name: Deep scan
+run-name: Deep scan ${{ inputs.run_key }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Public repository to scan, as owner/name"
+        required: true
+        type: string
+      commit:
+        description: "Full 40-character commit SHA to scan (leave empty for the default branch)"
+        required: false
+        default: ""
+        type: string
+      run_key:
+        description: "Job id (r plus 20 hex characters). The scanner API fills this in."
+        required: true
+        type: string
+
+# No permissions by default. Each job asks only for what it needs.
+permissions: {}
+
+jobs:
+  scan:
+    name: Analyse (read-only, no secrets)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the scanner (this repository)
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install analysis tools (pinned versions)
+        run: python -m pip install --disable-pip-version-check -r scripts/requirements.txt
+
+      # Inputs are passed through environment variables, never pasted into the
+      # script text, so a crafted input cannot inject shell commands.
+      - name: Run the deep scan
+        env:
+          TARGET: ${{ inputs.target }}
+          COMMIT: ${{ inputs.commit }}
+          RUN_KEY: ${{ inputs.run_key }}
+          OUT_DIR: ${{ runner.temp }}/out
+        run: python scripts/deep_scan.py
+
+      - name: Upload the report for the publish job
+        uses: actions/upload-artifact@v4
+        with:
+          name: report
+          path: ${{ runner.temp }}/out/report.json
+          if-no-files-found: error
+          retention-days: 1
+
+  report:
+    name: Send result to the scanner API
+    needs: scan
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+    steps:
+      - name: Download the report
+        if: ${{ needs.scan.result == 'success' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: report
+          path: incoming
+
+      # This job holds the callback secret, so it never touches the scanned code.
+      # It only wraps the report file as data and posts it, signed, to the API.
+      - name: Post the result
+        env:
+          RUN_KEY: ${{ inputs.run_key }}
+          SCAN_RESULT: ${{ needs.scan.result }}
+          API_URL: ${{ vars.SCAN_API_URL }}
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$RUN_KEY" =~ ^r[0-9a-f]{20}$ ]]; then
+            echo "run_key is not a valid job id" >&2
+            exit 1
+          fi
+          if ! [[ "$API_URL" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?$ ]]; then
+            echo "Set the repository variable SCAN_API_URL to your Worker address (https://...)" >&2
+            exit 1
+          fi
+          if [ -z "$CALLBACK_SECRET" ]; then
+            echo "Set the repository secret CALLBACK_SECRET" >&2
+            exit 1
+          fi
+          if [ "$SCAN_RESULT" = "success" ]; then
+            python3 -c "import json; r=json.load(open('incoming/report.json')); assert r.get('schema')==1; json.dump({'status':'done','report':r}, open('body.json','w'))"
+          else
+            echo '{"status":"failed","message":"The scan job did not finish. Please try again."}' > body.json
+          fi
+          SIG=$(openssl dgst -sha256 -hmac "$CALLBACK_SECRET" -hex body.json | awk '{print $NF}')
+          curl --fail --silent --show-error --max-time 60 \
+            -X POST "${API_URL}/callback?job=${RUN_KEY}" \
+            -H "Content-Type: application/json" \
+            -H "X-Signature: sha256=${SIG}" \
+            --data-binary @body.json
