@@ -58,7 +58,7 @@ jobs:
         run: python scripts/deep_scan.py
 
       - name: Upload the report for the publish job
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: report
           path: ${{ runner.temp }}/out/report.json
