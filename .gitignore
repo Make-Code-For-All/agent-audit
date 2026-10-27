@@ -1,0 +1,12 @@
+# Secrets and local settings: never commit these
+.env
+.env.*
+.dev.vars
+*.pem
+*.key
+*.p12
+
+# Tooling
+node_modules/
+.wrangler/
+.DS_Store
