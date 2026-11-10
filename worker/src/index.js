@@ -2,6 +2,8 @@
  *
  * It exists so visitors never need a GitHub token. The token lives here as a secret.
  *
+ *   GET  /repo            repository details and the exact commit, for the quick scan
+ *   GET  /archive/o/r/sha the whole repository at that commit as one .tar.gz, for the quick scan
  *   POST /scan            page asks for a deep scan of a public repository
  *   GET  /result/:id      page polls for the result
  *   POST /callback?job=   the GitHub Actions job posts its finished report (HMAC signed)
@@ -40,7 +42,9 @@ export default {
     if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
     let res;
     try {
-      if (url.pathname === '/scan' && request.method === 'POST') res = await handleScan(request, env);
+      if (url.pathname === '/repo' && request.method === 'GET') res = await handleRepo(request, url, env);
+      else if (url.pathname.startsWith('/archive/') && request.method === 'GET') res = await handleArchive(request, url, env);
+      else if (url.pathname === '/scan' && request.method === 'POST') res = await handleScan(request, env);
       else if (url.pathname.startsWith('/result/') && request.method === 'GET') res = await handleResult(url, env);
       else if (url.pathname === '/callback' && request.method === 'POST') res = await handleCallback(request, url, env);
       else res = json({ error: 'Not found' }, 404);
@@ -133,6 +137,85 @@ async function verifySignature(secret, bodyBytes, header) {
   if (!m || !secret) return false;
   const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']);
   return crypto.subtle.verify('HMAC', key, hexToBytes(m[1]), bodyBytes); // constant-time comparison
+}
+
+/* ------------------------------ GET /repo ------------------------------ */
+
+// Everything the quick scan needs to know about a repository, fetched with the Worker's own token
+// so visitors are not held to GitHub's 60-requests-per-hour limit for anonymous browsers.
+const REF_RE = /^[\w./@+-]{1,200}$/;
+const NOT_PUBLIC = 'Repository not found, or it is private. Only public repositories can be scanned.';
+
+function originAllowed(request, env) {
+  const origin = request.headers.get('Origin');
+  return !!origin && allowedOrigins(env).includes(origin);
+}
+
+async function handleRepo(request, url, env) {
+  if (!originAllowed(request, env)) return json({ error: 'This site is not allowed to use the scanner.' }, 403);
+  const requested = parseRepo(url.searchParams.get('repo'));
+  if (!requested) return json({ error: 'Enter a repository as owner/name or a github.com link.' }, 400);
+  const refIn = url.searchParams.get('ref') || '';
+  if (refIn && !REF_RE.test(refIn)) return json({ error: 'That branch, tag or commit contains characters that are not allowed.' }, 400);
+
+  const metaRes = await gh(env, '/repos/' + requested);
+  if (metaRes.status === 404) return json({ error: NOT_PUBLIC }, 404);
+  if (!metaRes.ok) { console.error('github repo lookup', metaRes.status); return json({ error: 'GitHub is not responding right now. Please try again shortly.' }, 502); }
+  const m = await metaRes.json();
+  if (m.private) return json({ error: NOT_PUBLIC }, 404);
+  const full = m.full_name;
+  const ref = refIn || m.default_branch;
+
+  const [commitsRes, ownerRes, contribRes] = await Promise.all([
+    gh(env, `/repos/${full}/commits?per_page=10&sha=${encodeURIComponent(ref)}`),
+    gh(env, '/users/' + full.split('/')[0]).catch(() => null),
+    gh(env, `/repos/${full}/contributors?per_page=30`).catch(() => null)
+  ]);
+  if (commitsRes.status === 404 || commitsRes.status === 409 || commitsRes.status === 422) return json({ error: 'No commits were found on ' + ref + ' in this repository.' }, 404);
+  if (!commitsRes.ok) { console.error('github commits lookup', commitsRes.status); return json({ error: 'GitHub is not responding right now. Please try again shortly.' }, 502); }
+  const list = await commitsRes.json();
+  if (!Array.isArray(list) || !list.length || !SHA_RE.test(String(list[0].sha))) return json({ error: 'No commits were found on ' + ref + ' in this repository.' }, 404);
+
+  const owner = ownerRes && ownerRes.ok ? await ownerRes.json().catch(() => null) : null;
+  const contributors = contribRes && contribRes.status === 200 ? await contribRes.json().catch(() => null) : null;
+  return json({
+    ref,
+    sha: list[0].sha,
+    meta: {
+      full_name: full, default_branch: m.default_branch, created_at: m.created_at, pushed_at: m.pushed_at,
+      stargazers_count: m.stargazers_count, forks_count: m.forks_count, size: m.size,
+      fork: !!m.fork, archived: !!m.archived,
+      parent: m.parent && m.parent.full_name ? { full_name: m.parent.full_name } : null,
+      license: m.license ? { spdx_id: m.license.spdx_id || null } : null
+    },
+    ownerInfo: owner ? { type: owner.type, created_at: owner.created_at } : null,
+    contributors: Array.isArray(contributors) ? contributors.map(() => ({})) : null,
+    commits: list.map((c) => ({
+      sha: c.sha,
+      commit: { message: String((c.commit && c.commit.message) || '').slice(0, 200),
+        author: { name: c.commit && c.commit.author && c.commit.author.name, date: c.commit && c.commit.author && c.commit.author.date } }
+    }))
+  });
+}
+
+/* ------------------------------ GET /archive/:owner/:repo/:sha ------------------------------ */
+
+// Passes GitHub's own .tar.gz of one commit straight through to the page. Browsers cannot download
+// that file from GitHub directly (it is not shared cross-site), and reading files one by one is what
+// used to cap the quick scan. No token is sent, so only public repositories can ever be served, and
+// the bytes are streamed, never stored or inspected here.
+async function handleArchive(request, url, env) {
+  if (!originAllowed(request, env)) return json({ error: 'This site is not allowed to use the scanner.' }, 403);
+  const parts = url.pathname.slice('/archive/'.length).split('/');
+  if (parts.length !== 3 || !REPO_RE.test(parts[0] + '/' + parts[1]) || parts[1] === '.' || parts[1] === '..' || !SHA_RE.test(parts[2])) {
+    return json({ error: 'Bad request.' }, 400);
+  }
+  const upstream = await fetch(`https://codeload.github.com/${parts[0]}/${parts[1]}/tar.gz/${parts[2]}`, {
+    headers: { 'User-Agent': 'agent-audit-api' }
+  });
+  if (upstream.status === 404) return json({ error: NOT_PUBLIC }, 404);
+  if (!upstream.ok || !upstream.body) { console.error('archive fetch', upstream.status); return json({ error: 'GitHub is not responding right now. Please try again shortly.' }, 502); }
+  return new Response(upstream.body, { status: 200, headers: { 'Content-Type': 'application/gzip' } });
 }
 
 /* ------------------------------ POST /scan ------------------------------ */

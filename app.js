@@ -104,9 +104,16 @@ async function gh(url, token, notFound){
 }
 async function fetchRaw(owner, repo, sha, path){
   const url = 'https://raw.githubusercontent.com/' + owner + '/' + repo + '/' + sha + '/' + encPath(path);
-  const res = await fetch(url, { signal: timeoutSignal(25000), cache:'no-store' });
-  if (!res.ok) throw new Error('HTTP ' + res.status);
-  return res.text();
+  // GitHub slows down bursts of file requests, so a busy or failed answer is retried a few times.
+  for (let attempt = 0; ; attempt++){
+    let res = null;
+    try { res = await fetch(url, { signal: timeoutSignal(25000), cache:'no-store' }); }
+    catch (e){ if (net.controller.signal.aborted || attempt >= 4) throw e; }
+    if (res && res.ok) return res.text();
+    if (res && res.status !== 429 && res.status < 500) throw new Error('HTTP ' + res.status);
+    if (attempt >= 4) throw new Error('HTTP ' + (res ? res.status : 'error'));
+    await sleep(1000 * 2 ** attempt);
+  }
 }
 async function pool(items, n, fn){
   let i = 0;
@@ -285,17 +292,19 @@ async function osvLookup(deps, findings, notes){
     d.approx = !/^==?\d/.test(d.spec) && !/^\d/.test(d.spec);
     uniq.set(d.eco + '|' + d.name + '|' + version, { package:{ name:d.name, ecosystem:d.eco }, version });
   }
-  const keys = [...uniq.keys()].slice(0, 500);
+  const keys = [...uniq.keys()];
   if (!keys.length) return;
-  if (uniq.size > 500) notes.push('Only the first 500 dependency versions were checked against OSV.');
-  let data;
+  const data = { results:[] };
   try {
-    const res = await fetch('https://api.osv.dev/v1/querybatch', {
-      method:'POST', headers:{ 'Content-Type':'application/json' },
-      body: JSON.stringify({ queries: keys.map((k) => uniq.get(k)) }), signal: timeoutSignal(30000)
-    });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    data = await res.json();
+    for (let i = 0; i < keys.length; i += 1000){ // OSV accepts up to 1,000 lookups per request
+      const res = await fetch('https://api.osv.dev/v1/querybatch', {
+        method:'POST', headers:{ 'Content-Type':'application/json' },
+        body: JSON.stringify({ queries: keys.slice(i, i + 1000).map((k) => uniq.get(k)) }), signal: timeoutSignal(60000)
+      });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const part = await res.json();
+      for (let j = 0; j < Math.min(1000, keys.length - i); j++) data.results.push(part.results ? part.results[j] : null);
+    }
   } catch (e){
     if (net.controller.signal.aborted) throw new ScanError('Scan cancelled.');
     notes.push('The OSV.dev vulnerability lookup failed, so dependencies were not checked for known vulnerabilities.');
@@ -347,6 +356,133 @@ function repoSignals(repo, owner, contributors, findings){
    ============================================================ */
 function log(msg, cls){ const li = h('li', { class: cls || '', text: msg }); $('log').append(li); return li; }
 
+// Everything one scan collects. A fresh one is made for each attempt, so a download that fails
+// part-way never leaves half its results behind.
+function newScan(){
+  return { findings:[], deps:[], notes:[],
+    cov:{ total:0, scanned:0, lines:0, bytes:0, skipped:[], failed:[], unsupported:0 },
+    binHits:{ exe:[], other:[], secret:[], maps:[] } };
+}
+
+// Decides whether one file is read. Every file in the repository passes through here exactly once.
+// There is no limit on how many files are accepted.
+function wantFile(s, path, size){
+  const b = basename(path), ext = extOf(path), cov = s.cov, binHits = s.binHits;
+  cov.total++;
+  if (/(?:^|\/)node_modules\//.test(path)){ cov.skipped.push(path + ' (node_modules)'); return false; }
+  if (SECRET_NAMES.test(b)) binHits.secret.push(path);
+  if (/\.(?:js|css|mjs)\.map$/i.test(b)){ binHits.maps.push(path); return false; }
+  if (BIN_EXECUTABLE.has(ext)){ binHits.exe.push(path); return false; }
+  if (BIN_OTHER.has(ext)){ binHits.other.push(path); return false; }
+  if (LOCKFILES.test(b)){ cov.unsupported++; return false; }
+  if (!SCAN_EXTS.has(ext)){ cov.unsupported++; return false; }
+  if (size > LIMITS.fileBytes){ cov.skipped.push(path + ' (single file over ' + (LIMITS.fileBytes / 1048576) + ' MB)'); return false; }
+  return true;
+}
+
+function scanFile(s, path, text, size){
+  const cov = s.cov;
+  if (text.indexOf('\u0000') !== -1){ cov.skipped.push(path + ' (binary content)'); return; }
+  cov.scanned++; cov.bytes += size; cov.lines += text.split('\n').length;
+  scanText(path, text, s.findings);
+  const b = basename(path), ext = extOf(path);
+  if (b === 'package.json') analyzePackageJson(path, text, s.findings, s.deps);
+  else if (/^requirements.*\.txt$/i.test(b)) analyzeRequirements(path, text, s.findings, s.deps);
+  if (ext === 'json' && /"mcp(?:Servers|_servers)"/.test(text)) analyzeMcp(path, text, s.findings);
+}
+
+// Repository details and the exact commit. The scan service answers this with its own GitHub access,
+// so visitors need no token; if it cannot be reached, GitHub is asked directly.
+async function loadRepo(owner, repo, refInput, token){
+  if (SITE.api && !token){
+    try {
+      const d = await api('/repo?repo=' + encodeURIComponent(owner + '/' + repo) + (refInput ? '&ref=' + encodeURIComponent(refInput) : ''));
+      if (d && d.meta && typeof d.meta === 'object' && /^[0-9a-f]{40}$/.test(String(d.sha)) && Array.isArray(d.commits) && d.commits.length)
+        return { meta:d.meta, ownerInfo:d.ownerInfo || null, contributors:Array.isArray(d.contributors) ? d.contributors : null,
+          commits:d.commits, sha:d.sha, ref:String(d.ref || refInput || d.meta.default_branch) };
+    } catch (e){
+      if (net.controller.signal.aborted) throw new ScanError('Scan cancelled.');
+    }
+  }
+  const base = 'https://api.github.com/repos/' + owner + '/' + repo;
+  const meta = await gh(base, token);
+  const [ownerInfo, contributors] = await Promise.all([
+    gh('https://api.github.com/users/' + owner, token).catch(() => null),
+    gh(base + '/contributors?per_page=30', token).catch(() => null)
+  ]);
+  const ref = refInput || meta.default_branch;
+  const commits = await gh(base + '/commits?sha=' + encodeURIComponent(ref) + '&per_page=10', token);
+  if (!commits || !commits.length) throw new ScanError('The repository has no commits on ' + ref + '.');
+  return { meta, ownerInfo, contributors, commits, sha:commits[0].sha, ref };
+}
+
+// Preferred route: the whole repository arrives as one download and is unpacked and scanned as it
+// streams in, so the number of files and the size of the repository do not matter.
+async function scanArchive(s, owner, repo, sha){
+  const prog = $('progress');
+  const idle = new AbortController();
+  let timer = null;
+  const kick = () => { clearTimeout(timer); timer = setTimeout(() => idle.abort(), 90000); };
+  const onCancel = () => idle.abort();
+  net.controller.signal.addEventListener('abort', onCancel, { once:true });
+  kick();
+  try {
+    const res = await fetch(SITE.api + '/archive/' + owner + '/' + repo + '/' + sha, { signal: idle.signal, cache:'no-store' });
+    if (!res.ok || !res.body) throw new Error('HTTP ' + res.status);
+    let got = 0, lastYield = performance.now();
+    const counted = res.body.pipeThrough(new TransformStream({
+      transform(chunk, ctl){ got += chunk.byteLength; kick(); ctl.enqueue(chunk); }
+    }));
+    const decoder = new TextDecoder('utf-8');
+    const paint = () => { prog.textContent = fmtNum(s.cov.scanned) + ' files read so far, ' + (got / 1048576).toFixed(1) + ' MB downloaded'; };
+    await readTarGz(counted, {
+      entry: (e) => e.type === 'file' && wantFile(s, e.path, e.size),
+      file: async (path, bytes) => {
+        scanFile(s, path, decoder.decode(bytes), bytes.length);
+        if (performance.now() - lastYield > 40){ // let the page repaint and stay responsive
+          paint(); kick();
+          await new Promise((r) => setTimeout(r, 0));
+          lastYield = performance.now();
+        }
+      }
+    });
+    paint();
+  } finally {
+    clearTimeout(timer);
+    net.controller.signal.removeEventListener('abort', onCancel);
+  }
+}
+
+// Fallback route when the scan service is not available: list the files through GitHub's API and
+// read them one at a time. Slower on big repositories, but still reads every scannable file.
+async function scanTree(s, owner, repo, sha, token){
+  const tree = await gh('https://api.github.com/repos/' + owner + '/' + repo + '/git/trees/' + sha + '?recursive=1', token);
+  if (tree.truncated) s.notes.push('The repository is so large that GitHub shortened its file list, so some files were never seen. Try again later: the full-repository download was not available for this scan.');
+  const picked = [];
+  for (const e of tree.tree){
+    if (e.type !== 'blob') continue;
+    if (!wantFile(s, e.path, e.size)) continue;
+    const b = basename(e.path), ext = extOf(e.path);
+    let prio = 3;
+    if (/^(?:package\.json|setup\.py|pyproject\.toml|dockerfile|makefile)$/i.test(b) || /^requirements.*\.txt$/i.test(b) || /^\.github\/workflows\//.test(e.path) || /mcp/i.test(b)) prio = 0;
+    else if (['sh','bash','zsh','ksh','ps1','psm1','bat','cmd'].includes(ext)) prio = 1;
+    else if (GROUPS.CODE.has(ext)) prio = 2;
+    picked.push({ path:e.path, size:e.size, prio });
+  }
+  picked.sort((a, b) => a.prio - b.prio || a.size - b.size);
+  log('Reading ' + fmtNum(picked.length) + ' files one at a time');
+  const prog = $('progress');
+  let done = 0;
+  await pool(picked, LIMITS.concurrency, async (c) => {
+    try { scanFile(s, c.path, await fetchRaw(owner, repo, sha, c.path), c.size); }
+    catch (e){
+      if (net.controller.signal.aborted) return;
+      s.cov.failed.push(c.path);
+    }
+    done++; prog.textContent = fmtNum(done) + ' of ' + fmtNum(picked.length) + ' files read';
+  });
+}
+
 async function runScan(){
   const parsed = parseRepo($('repo').value);
   const out = $('out'); out.hidden = true; out.replaceChildren();
@@ -361,51 +497,32 @@ async function runScan(){
   if (wantDeep && SITE.turnstileSiteKey && !tsToken){ log('Please wait a moment for the security check to finish, then press Scan again.', 'err'); return; }
 
   net.controller = new AbortController();
+  net.rate = null;
   $('go').disabled = true; $('cancel').hidden = false;
-  const findings = [], deps = [], notes = [];
   try {
     log('Fetching repository details');
-    const base = 'https://api.github.com/repos/' + owner + '/' + repo;
-    const meta = await gh(base, token);
-    const [ownerInfo, contributors] = await Promise.all([
-      gh('https://api.github.com/users/' + owner, token).catch(() => null),
-      gh(base + '/contributors?per_page=30', token).catch(() => null)
-    ]);
-    const ref = refInput || meta.default_branch;
-    log('Resolving ' + ref + ' to a fixed commit');
-    const commits = await gh(base + '/commits?sha=' + encodeURIComponent(ref) + '&per_page=10', token);
-    if (!commits || !commits.length) throw new ScanError('The repository has no commits on ' + ref + '.');
-    const sha = commits[0].sha;
-    log('Listing files at commit ' + sha.slice(0, 7));
-    const tree = await gh(base + '/git/trees/' + sha + '?recursive=1', token);
-    if (tree.truncated) notes.push('The repository is very large and GitHub truncated the file list, so some files were never seen.');
+    const { meta, ownerInfo, contributors, commits, sha, ref } = await loadRepo(owner, repo, refInput, token);
 
-    const blobs = tree.tree.filter((e) => e.type === 'blob');
-    const cov = { total:blobs.length, scanned:0, lines:0, bytes:0, skipped:[], failed:[], unsupported:0 };
-    const cands = [];
-    const binHits = { exe:[], other:[], secret:[], maps:[] };
-    for (const e of blobs){
-      const path = e.path, b = basename(path), ext = extOf(path);
-      if (/(?:^|\/)node_modules\//.test(path)){ cov.skipped.push(path + ' (node_modules)'); continue; }
-      if (SECRET_NAMES.test(b)) binHits.secret.push(path);
-      if (/\.(?:js|css|mjs)\.map$/i.test(b)){ binHits.maps.push(path); continue; }
-      if (BIN_EXECUTABLE.has(ext)){ binHits.exe.push(path); continue; }
-      if (BIN_OTHER.has(ext)){ binHits.other.push(path); continue; }
-      if (LOCKFILES.test(b)){ cov.unsupported++; continue; }
-      if (!SCAN_EXTS.has(ext)){ cov.unsupported++; continue; }
-      if (e.size > LIMITS.fileBytes){ cov.skipped.push(path + ' (over ' + (LIMITS.fileBytes/1024) + ' KB)'); continue; }
-      let prio = 3;
-      if (/^(?:package\.json|setup\.py|pyproject\.toml|dockerfile|makefile)$/i.test(b) || /^requirements.*\.txt$/i.test(b) || /^\.github\/workflows\//.test(path) || /mcp/i.test(b)) prio = 0;
-      else if (['sh','bash','zsh','ksh','ps1','psm1','bat','cmd'].includes(ext)) prio = 1;
-      else if (GROUPS.CODE.has(ext)) prio = 2;
-      cands.push({ path, size:e.size, prio });
+    let s = null;
+    if (SITE.api && typeof DecompressionStream === 'function'){
+      log('Downloading and scanning the whole repository at commit ' + sha.slice(0, 7) + ' (the code is read as text and never executed)');
+      try { s = newScan(); await scanArchive(s, owner, repo, sha); }
+      catch (e){
+        if (net.controller.signal.aborted) throw new ScanError('Scan cancelled.');
+        s = null;
+        log('The single download was not available, so the files are being read one at a time instead.');
+      }
     }
-    cands.sort((a, b) => a.prio - b.prio || a.size - b.size);
-    const picked = []; let bytes = 0;
-    for (const c of cands){
-      if (picked.length >= LIMITS.files || bytes + c.size > LIMITS.totalBytes){ cov.skipped.push(c.path + ' (scan limit reached)'); continue; }
-      picked.push(c); bytes += c.size;
+    if (!s){
+      log('Listing files at commit ' + sha.slice(0, 7));
+      s = newScan();
+      await scanTree(s, owner, repo, sha, token);
     }
+    if (net.controller.signal.aborted) throw new ScanError('Scan cancelled.');
+    const { findings, deps, notes, cov, binHits } = s;
+    $('progress').textContent = fmtNum(cov.scanned) + ' files read';
+    if (cov.failed.length) notes.push(cov.failed.length + ' files could not be downloaded and were not scanned.');
+
     if (binHits.exe.length) add(findings, { rule:'BIN-EXEC', sev:'medium', title:'Compiled executables committed to the repository',
       why:'Binaries cannot be reviewed as source. Prefer repositories that build from source, or verify these files separately.', snippet:'', files:binHits.exe });
     if (binHits.other.length) add(findings, { rule:'BIN-OTHER', sev:'low', title:'Archives or bytecode committed to the repository',
@@ -415,32 +532,8 @@ async function runScan(){
     if (binHits.secret.length) add(findings, { rule:'SECRET-FILE', sev:'medium', title:'Sensitive-looking files committed',
       why:'Key files and .env files in a repository are either leaked secrets or a sign of careless handling.', snippet:'', files:binHits.secret });
 
-    log('Scanning ' + picked.length + ' files (the code is read as text and never executed)');
-    const prog = $('progress');
-    let done = 0;
-    await pool(picked, LIMITS.concurrency, async (c) => {
-      try {
-        const text = await fetchRaw(owner, repo, sha, c.path);
-        if (text.indexOf('\u0000') !== -1){ cov.skipped.push(c.path + ' (binary content)'); }
-        else {
-          cov.scanned++; cov.bytes += c.size; cov.lines += text.split('\n').length;
-          scanText(c.path, text, findings);
-          const b = basename(c.path), ext = extOf(c.path);
-          if (b === 'package.json') analyzePackageJson(c.path, text, findings, deps);
-          else if (/^requirements.*\.txt$/i.test(b)) analyzeRequirements(c.path, text, findings, deps);
-          if (ext === 'json' && /"mcp(?:Servers|_servers)"/.test(text)) analyzeMcp(c.path, text, findings);
-        }
-      } catch (e){
-        if (net.controller.signal.aborted) return;
-        cov.failed.push(c.path);
-      }
-      done++; prog.textContent = done + ' of ' + picked.length + ' files read';
-    });
-    if (net.controller.signal.aborted) throw new ScanError('Scan cancelled.');
-    if (cov.failed.length) notes.push(cov.failed.length + ' files could not be downloaded and were not scanned.');
-
     if (deps.length){
-      log('Checking ' + deps.length + ' dependencies against OSV.dev');
+      log('Checking ' + fmtNum(deps.length) + ' dependencies against OSV.dev');
       typosquat(deps, findings);
       await osvLookup(deps, findings, notes);
     }
@@ -558,8 +651,8 @@ function render(r){
   // Coverage
   out.append(h('h2', { text:'Coverage' }));
   const covList = h('ul', { class:'notes' },
-    h('li', { text: cov.scanned + ' of ' + fmtNum(cov.total) + ' files were read (' + fmtNum(cov.lines) + ' lines). ' + fmtNum(cov.unsupported) + ' files were skipped because their type is not scanned (images, lockfiles and similar).' }),
-    cov.skipped.length ? h('li', { text: cov.skipped.length + ' scannable files were skipped. Examples: ' + cov.skipped.slice(0, 4).map(sanitize).join('; ') + '.' }) : null,
+    h('li', { text: fmtNum(cov.scanned) + ' of ' + fmtNum(cov.total) + ' files were read (' + fmtNum(cov.lines) + ' lines). There is no limit on the number of files or the size of the repository. ' + fmtNum(cov.unsupported) + ' files were skipped because their type is not scanned (images, lockfiles and similar).' }),
+    cov.skipped.length ? h('li', { text: fmtNum(cov.skipped.length) + ' files were set aside (bundled node_modules, binary content or a single oversized file); the JSON report lists them all. Examples: ' + cov.skipped.slice(0, 4).map(sanitize).join('; ') + '.' }) : null,
     notes.map((n) => h('li', { text:n })),
     h('li', { text:'Only package.json and requirements files are parsed for dependencies in this version. Lockfiles, pyproject.toml, Cargo and Go modules are not.' }),
     r.rate ? h('li', { text:'GitHub API requests left this hour: ' + r.rate.remaining + ' of ' + r.rate.limit + '.' }) : null);
@@ -580,8 +673,8 @@ let current = null;
 function downloadReport(){
   const r = current; if (!r) return;
   const { owner, repo, sha, findings, deps, cov, notes, counts } = r;
-  const report = { tool:'agent-audit v0.2', scannedAt:new Date().toISOString(), repository:owner + '/' + repo, commit:sha, ref:r.ref,
-    summary:counts, coverage:{ filesInRepo:cov.total, filesScanned:cov.scanned, skipped:cov.skipped, failed:cov.failed, notes },
+  const report = { tool:'agent-audit v0.3', scannedAt:new Date().toISOString(), repository:owner + '/' + repo, commit:sha, ref:r.ref,
+    summary:counts, coverage:{ filesInRepo:cov.total, filesScanned:cov.scanned, linesScanned:cov.lines, bytesScanned:cov.bytes, skipped:cov.skipped, failed:cov.failed, notes },
     findings:findings.map((f) => ({ rule:f.rule, severity:f.sev, title:f.title, file:f.file, line:f.line, snippet:f.snippet, files:f.files })),
     dependencies:deps.map((d) => ({ name:d.name, ecosystem:d.eco, spec:d.spec, version:d.version || null, scope:d.dev ? 'dev' : 'runtime', file:d.file, advisories:d.vulns || [] })),
     deepScan:r.deep };

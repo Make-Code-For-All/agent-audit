@@ -5,16 +5,20 @@ const env = { ALLOWED_ORIGIN:'https://me.github.io', SCANNER_REPO:'me/agent-audi
   GITHUB_TOKEN:'tok', CALLBACK_SECRET:'s3cret',
   SCANS:{ get:async k=>store.has(k)?store.get(k):null, put:async(k,v)=>{store.set(k,v)}, delete:async k=>{store.delete(k)} } };
 const SHA='a'.repeat(40);
-let dispatched=[];
+let dispatched=[]; let archiveAuth='unset';
 globalThis.fetch = async (url, init={}) => {
   const u=String(url);
   if (u==='https://api.github.com/repos/octo/hello') return Response.json({full_name:'octo/hello',private:false,size:100,default_branch:'main'});
   if (u==='https://api.github.com/repos/octo/secret') return Response.json({full_name:'octo/secret',private:true,size:1,default_branch:'main'});
   if (u==='https://api.github.com/repos/octo/missing') return new Response('{}',{status:404});
   if (u==='https://api.github.com/repos/octo/huge') return Response.json({full_name:'octo/huge',private:false,size:9e6,default_branch:'main'});
-  if (u.startsWith('https://api.github.com/repos/octo/hello/commits?')) return Response.json([{sha:SHA}]);
   if (u===`https://api.github.com/repos/octo/hello/commits/${SHA}`) return Response.json({sha:SHA});
   if (u.includes('/actions/workflows/scan.yml/dispatches')) { dispatched.push(JSON.parse(init.body)); return new Response(null,{status:204}); }
+  if (u.startsWith('https://api.github.com/repos/octo/hello/commits?')) return Response.json([{sha:SHA,commit:{message:'m',author:{name:'n',date:'2024-01-01T00:00:00Z'}}}]);
+  if (u==='https://api.github.com/users/octo') return Response.json({type:'User',created_at:'2015-01-01T00:00:00Z',email:'private@example.com'});
+  if (u==='https://api.github.com/repos/octo/hello/contributors?per_page=30') return Response.json([{login:'a'},{login:'b'}]);
+  if (u===`https://codeload.github.com/octo/hello/tar.gz/${SHA}`) { archiveAuth=(init.headers||{}).Authorization; return new Response('TARBYTES'); }
+  if (u===`https://codeload.github.com/octo/secret/tar.gz/${SHA}`) return new Response('',{status:404});
   throw new Error('unexpected fetch '+u);
 };
 const call=(path,opts={})=>worker.fetch(new Request('https://api.example'+path,{...opts,headers:{Origin:'https://me.github.io','CF-Connecting-IP':opts.ip||'1.1.1.1','Content-Type':'application/json',...(opts.headers||{})}}),env);
@@ -66,5 +70,21 @@ let last; for(let i=0;i<8;i++){ last=await scan({repo:'octo/missing'},'9.9.9.9')
 // dispatch failure cleans up
 const orig=globalThis.fetch; globalThis.fetch=async(u,i)=>String(u).includes('dispatches')?new Response('boom',{status:500}):orig(u,i);
 store.clear(); r=await scan({repo:'octo/hello'},'4.4.4.4'); ok(r.status===502,'dispatch failure -> 502'); ok(![...store.keys()].some(k=>k.startsWith('job:')),'no orphan job');
+// quick-scan endpoints: repository details and whole-repository archive
+r=await call('/repo?repo='+encodeURIComponent('https://github.com/octo/hello')); j=await r.json();
+ok(r.status===200&&j.sha===SHA&&j.ref==='main'&&j.meta.default_branch==='main'&&j.contributors.length===2&&j.commits[0].commit.message==='m','repo details');
+ok(j.ownerInfo.type==='User'&&!('email' in j.ownerInfo),'owner details are trimmed');
+r=await call('/repo?repo=octo/secret'); ok(r.status===404,'repo details refuse private');
+r=await call('/repo?repo=octo/missing'); ok(r.status===404,'repo details missing');
+r=await call('/repo?repo=octo/hello&ref='+encodeURIComponent('bad ref;')); ok(r.status===400,'repo details bad ref');
+r=await call('/repo?repo=octo/hello',{headers:{Origin:'https://evil.example'}}); ok(r.status===403,'repo details other origin');
+r=await call(`/archive/octo/hello/${SHA}`);
+ok(r.status===200&&(await r.text())==='TARBYTES'&&r.headers.get('access-control-allow-origin')==='https://me.github.io','archive passes through');
+ok(archiveAuth===undefined,'archive request carries no token');
+r=await call(`/archive/octo/secret/${SHA}`); ok(r.status===404,'archive private is 404');
+r=await call('/archive/octo/hello/main'); ok(r.status===400,'archive needs a full commit');
+r=await call(`/archive/octo/../${SHA}`); ok(r.status===400||r.status===404,'archive rejects dot-dot');
+r=await call(`/archive/octo/hello/${SHA}`,{headers:{Origin:'https://evil.example'}}); ok(r.status===403,'archive other origin');
 console.log(`${pass} passed, ${fail} failed`);
+
 process.exit(fail?1:0);

@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' https://challenges.cloudflare.com; style-src 'self'; connect-src https://api.github.com https://raw.githubusercontent.com https://api.osv.dev https://*.workers.dev; frame-src https://challenges.cloudflare.com; base-uri 'none'; form-action 'none'">
-<title>Agent Audit: quick repository scanner</title>
+<title>Agent Audit: repository scanner</title>
 <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -23,7 +23,7 @@
         <button class="primary" type="submit" id="go">Scan repository</button>
         <button class="ghost" type="button" id="cancel" hidden>Cancel</button>
       </div>
-      <p class="hint">Public repositories only. Files are fetched from GitHub and analysed in your browser; nothing is sent to any server of ours.</p>
+      <p class="hint">Public repositories only, any size, nothing to install or sign in to. The whole repository is downloaded from GitHub through this site’s scan service and analysed in your browser; the service only passes the download along and keeps none of it.</p>
       <label class="check" for="deep" id="deep-row" hidden>
         <input type="checkbox" id="deep" checked>
         <span>Also run the deep scan
@@ -40,7 +40,7 @@
           <div>
             <label for="token">GitHub token</label>
             <input type="password" id="token" placeholder="Optional" autocomplete="off" spellcheck="false">
-            <p class="hint">Only useful if you scan many repositories: it raises GitHub’s limit for the quick scan from 60 to 5,000 requests per hour. Use a token with no permissions. It is kept in memory, sent only to api.github.com, and cleared when you reload the page. The deep scan never needs it.</p>
+            <p class="hint">You do not need one. It is only a backup for when this site’s scan service is unreachable and GitHub’s limit for anonymous visitors (60 requests per hour) has run out. Use a token with no permissions. It is kept in memory, sent only to api.github.com, and cleared when you reload the page.</p>
           </div>
         </div>
       </details>
@@ -65,6 +65,7 @@
 
 <script src="config.js"></script>
 <script src="rules.js"></script>
+<script src="tar.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

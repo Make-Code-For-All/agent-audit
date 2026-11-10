@@ -55,8 +55,8 @@ def run(cmd, cwd=None, timeout=300, extra_env=None):
     )
 
 
-def walk(root, names=None, suffix=None, limit=20):
-    """Find files under root, skipping .git and node_modules, up to limit."""
+def walk(root, names=None, suffix=None, limit=None):
+    """Find files under root, skipping .git and node_modules. All of them unless a limit is given."""
     found = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
@@ -64,7 +64,7 @@ def walk(root, names=None, suffix=None, limit=20):
             ok = (names and name in names) or (suffix and suffix(name))
             if ok:
                 found.append(Path(dirpath) / name)
-                if len(found) >= limit:
+                if limit and len(found) >= limit:
                     return found
     return found
 
@@ -198,7 +198,7 @@ PIN = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)(?:\[[^\]]*\])?\s*==\s*([A-Za-z0
 
 def pinned_python_requirements():
     pins = {}
-    for path in walk(root, suffix=lambda n: re.fullmatch(r"requirements.*\.txt", n) is not None, limit=20):
+    for path in walk(root, suffix=lambda n: re.fullmatch(r"requirements.*\.txt", n) is not None):
         try:
             text = path.read_text(errors="replace")
         except OSError:
@@ -213,7 +213,7 @@ def pinned_python_requirements():
 
 def npm_lock_packages():
     pkgs = {}
-    for path in walk(root, names={"package-lock.json"}, limit=5):
+    for path in walk(root, names={"package-lock.json"}):
         try:
             data = json.loads(path.read_text(errors="replace"))
         except (OSError, ValueError):
@@ -266,7 +266,7 @@ def tool_npm_audit():
     findings = []
     ran = 0
     skipped = []
-    for pkg_json in walk(root, names={"package.json"}, limit=5):
+    for pkg_json in walk(root, names={"package.json"}, limit=50):
         folder = pkg_json.parent
         lock = folder / "package-lock.json"
         if not lock.exists():
@@ -318,7 +318,6 @@ def tool_osv_malicious():
         owners.append((name, version, file))
     if not queries:
         return {"ok": True, "findings": [], "note": "No lockfile or pinned requirements to check."}
-    queries, owners = queries[:3000], owners[:3000]
     out = []
     try:
         for i in range(0, len(queries), 1000):
@@ -370,7 +369,7 @@ def declared_packages():
     """(kind, name) -> manifest file, for registry-style dependencies only."""
     wanted = {}
     local_names = set()
-    manifests = walk(root, names={"package.json"}, limit=20)
+    manifests = walk(root, names={"package.json"})
     for path in manifests:
         try:
             data = json.loads(path.read_text(errors="replace"))
@@ -382,7 +381,7 @@ def declared_packages():
             for name, spec in (data.get(section) or {}).items():
                 if isinstance(spec, str) and not NON_REGISTRY_SPEC.match(spec) and NPM_NAME.match(name):
                     wanted[("npm", name)] = rel(path, root)
-    for path in walk(root, suffix=lambda n: re.fullmatch(r"requirements.*\.txt", n) is not None, limit=20):
+    for path in walk(root, suffix=lambda n: re.fullmatch(r"requirements.*\.txt", n) is not None):
         try:
             text = path.read_text(errors="replace")
         except OSError:
@@ -401,7 +400,7 @@ def tool_registry():
     wanted = declared_packages()
     if not wanted:
         return {"ok": True, "findings": [], "note": "No registry dependencies were found to check."}
-    items = list(wanted.items())[:300]
+    items = list(wanted.items())
     with ThreadPoolExecutor(max_workers=8) as pool:
         answers = list(pool.map(lambda kv: registry_exists(kv[0][0], kv[0][1]), items))
     out = []
@@ -416,8 +415,6 @@ def tool_registry():
     note = str(len(items)) + " package names checked."
     if unknown:
         note += " " + str(unknown) + " could not be checked because the registry did not answer."
-    if len(wanted) > 300:
-        note += " Only the first 300 were checked."
     return {"ok": True, "findings": finish(out), "note": note}
 
 

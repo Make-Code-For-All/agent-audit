@@ -200,4 +200,6 @@ const FILE_RULES = [
 
 const SEV = ['critical','high','medium','low','info'];
 const SEV_LABEL = {critical:'Critical',high:'High',medium:'Medium',low:'Low',info:'Info'};
-const LIMITS = { files:250, fileBytes:400*1024, totalBytes:8*1024*1024, perFileRule:3, shownPerGroup:20, longLine:1500, lineCap:4000, concurrency:8 };
+// There is no cap on how many files are scanned or on the repository's total size.
+// fileBytes only sets aside single text files too large to be hand-written source (they are listed under Coverage).
+const LIMITS = { fileBytes:10*1024*1024, perFileRule:3, shownPerGroup:20, longLine:1500, lineCap:4000, concurrency:8 };
