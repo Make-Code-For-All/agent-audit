@@ -4,15 +4,15 @@ compatibility_date = "2025-01-01"
 
 [vars]
 # Where your scanner page lives (origin only, no path). Separate several with commas.
-ALLOWED_ORIGIN = "https://make-code-for-all.github.io"
+ALLOWED_ORIGIN = "https://make-code-for-all.github.io/"
 # The repository that holds .github/workflows/scan.yml
-SCANNER_REPO = "Make-Code-For-All/agent-audit"
+SCANNER_REPO = "make-code-for-all/agent-audit"
 SCANNER_BRANCH = "main"
 WORKFLOW_FILE = "scan.yml"
 
 [[kv_namespaces]]
 binding = "SCANS"
-id = "PASTE_KV_NAMESPACE_ID_HERE"
+id = "751c15e9d8794849bf64de2bf54470f6"
 
 # Secrets (set with `npx wrangler secret put NAME`, never written in this file):
 #   GITHUB_TOKEN      fine-grained token for the scanner repo, Actions: read and write
