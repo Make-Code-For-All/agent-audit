@@ -23,27 +23,13 @@
         <button class="primary" type="submit" id="go">Scan repository</button>
         <button class="ghost" type="button" id="cancel" hidden>Cancel</button>
       </div>
-      <p class="hint">Public repositories only, any size, nothing to install or sign in to. The whole repository is downloaded from GitHub through this site’s scan service and analysed in your browser; the service only passes the download along and keeps none of it.</p>
+      <p class="hint">Public repositories only, any size, nothing to install or sign in to. To scan a particular branch, paste its link (github.com/owner/name/tree/branch). The whole repository is downloaded from GitHub through this site’s scan service and analysed in your browser; the service only passes the download along and keeps none of it.</p>
       <label class="check" for="deep" id="deep-row" hidden>
         <input type="checkbox" id="deep" checked>
         <span>Also run the deep scan
           <small>Adds Semgrep, secret detection and dependency audits, run in the background on GitHub. Takes a few minutes.</small></span>
       </label>
       <div id="ts-box"></div>
-      <details class="opt">
-        <summary>Optional settings</summary>
-        <div class="opt-body">
-          <div>
-            <label for="ref">Branch, tag or commit</label>
-            <input type="text" id="ref" placeholder="Leave empty for the default branch" spellcheck="false" autocapitalize="off">
-          </div>
-          <div>
-            <label for="token">GitHub token</label>
-            <input type="password" id="token" placeholder="Optional" autocomplete="off" spellcheck="false">
-            <p class="hint">You do not need one. It is only a backup for when this site’s scan service is unreachable and GitHub’s limit for anonymous visitors (60 requests per hour) has run out. Use a token with no permissions. It is kept in memory, sent only to api.github.com, and cleared when you reload the page.</p>
-          </div>
-        </div>
-      </details>
     </form>
     <div id="status" aria-live="polite" hidden>
       <ul id="log"></ul>

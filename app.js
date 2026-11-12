@@ -57,7 +57,13 @@ function parseRepo(input){
   const repo = parts[1].replace(/\.git$/i,'');
   if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/.test(owner)) return null;
   if (!/^[A-Za-z0-9_.-]{1,100}$/.test(repo) || repo === '.' || repo === '..') return null;
-  return { owner, repo };
+  // A link to a branch, tag or commit (…/tree/NAME, …/commit/SHA) scans that version instead of the default branch.
+  let ref = '';
+  if (['tree','blob','commit','releases'].includes(parts[2])){
+    try { ref = decodeURIComponent(parts[2] === 'releases' ? (parts[3] === 'tag' ? parts[4] || '' : '') : parts[3] || ''); } catch (e) { return null; }
+  }
+  if (ref && !/^[\w.@+-]{1,200}$/.test(ref)) return null;
+  return { owner, repo, ref };
 }
 function levenshtein(a, b){
   if (Math.abs(a.length - b.length) > 1) return 2;
@@ -93,10 +99,10 @@ async function gh(url, token, notFound){
   if (res.status === 204) return null;
   if (!res.ok){
     if (res.status === 404) throw new ScanError(notFound || 'Repository not found. It may be private or misspelled. This version supports public repositories only.');
-    if (res.status === 401) throw new ScanError('GitHub rejected the token. Remove it or paste a valid one.');
+    if (res.status === 401) throw new ScanError('GitHub refused the request. Please try again in a moment.');
     if ((res.status === 403 || res.status === 429) && rem === '0'){
       const when = net.rate ? new Date(net.rate.reset * 1000).toLocaleTimeString() : 'later';
-      throw new ScanError('GitHub rate limit reached. Try again after ' + when + ', or add a token under Optional settings.');
+      throw new ScanError('GitHub is limiting requests from your network right now. Try again after ' + when + '.');
     }
     throw new ScanError('GitHub returned an error (' + res.status + ').');
   }
@@ -402,6 +408,7 @@ async function loadRepo(owner, repo, refInput, token){
           commits:d.commits, sha:d.sha, ref:String(d.ref || refInput || d.meta.default_branch) };
     } catch (e){
       if (net.controller.signal.aborted) throw new ScanError('Scan cancelled.');
+      log('This site\u2019s scan service did not answer, so GitHub is being asked directly (limited to 60 requests an hour per network).');
     }
   }
   const base = 'https://api.github.com/repos/' + owner + '/' + repo;
@@ -489,9 +496,8 @@ async function runScan(){
   $('log').replaceChildren(); $('progress').textContent = ''; $('status').hidden = false;
   if (!parsed){ log('Enter a repository as owner/name or a github.com link.', 'err'); return; }
   const { owner, repo } = parsed;
-  const token = $('token').value.trim();
-  const refInput = $('ref').value.trim();
-  if (refInput && !/^[\w./@+-]{1,200}$/.test(refInput)){ log('That branch, tag or commit contains characters that are not allowed.', 'err'); return; }
+  const token = '';            // visitors never need one: the scan service talks to GitHub for them
+  const refInput = parsed.ref; // empty means the default branch
 
   const wantDeep = deepEnabled() && $('deep').checked;
   if (wantDeep && SITE.turnstileSiteKey && !tsToken){ log('Please wait a moment for the security check to finish, then press Scan again.', 'err'); return; }
@@ -736,7 +742,7 @@ async function api(path, init){
   try { res = await fetch(SITE.api + path, Object.assign({ signal: timeoutSignal(30000), cache:'no-store' }, init || {})); }
   catch (e){
     if (net.controller.signal.aborted) throw new ScanError('Scan cancelled.');
-    throw new ScanError('Could not reach the scan service. Try again in a moment.');
+    throw new ScanError('Could not reach the scan service. It may be offline, or it may not be set to accept requests from this website.');
   }
   let data = null; try { data = await res.json(); } catch (e) { /* not JSON */ }
   if (!res.ok){
