@@ -22,6 +22,15 @@ function h(tag, props, ...kids){
   for (const kid of kids.flat(Infinity)){ if (kid === null || kid === undefined || kid === false) continue; el.append(kid); }
   return el;
 }
+// Small line icons. Built with the SVG namespace so they render, and with no inline styles so the strict style policy holds.
+function icon(paths, size){
+  const NS = 'http://www.w3.org/2000/svg';
+  const el = document.createElementNS(NS, 'svg');
+  const attrs = { viewBox:'0 0 24 24', width:size || 24, height:size || 24, fill:'none', stroke:'currentColor', 'stroke-width':'2.2', 'stroke-linecap':'round', 'stroke-linejoin':'round', 'aria-hidden':'true' };
+  for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, String(v));
+  for (const d of paths){ const p = document.createElementNS(NS, 'path'); p.setAttribute('d', d); el.append(p); }
+  return el;
+}
 const basename = (p) => p.slice(p.lastIndexOf('/') + 1);
 function extOf(p){
   const b = basename(p).toLowerCase();
@@ -360,7 +369,27 @@ function repoSignals(repo, owner, contributors, findings){
 /* ============================================================
    Scan pipeline
    ============================================================ */
-function log(msg, cls){ const li = h('li', { class: cls || '', text: msg }); $('log').append(li); return li; }
+// Progress lines are shown as steps: the newest one is "in progress" and earlier ones are ticked off.
+let lastLog = null;
+function log(msg, cls){
+  if (lastLog && lastLog.className === 'now') lastLog.className = 'done';
+  const li = h('li', { class: cls || 'now', text: msg });
+  $('log').append(li);
+  lastLog = li;
+  return li;
+}
+function setStats(a, aLabel, b, bLabel){
+  $('stats').hidden = false;
+  $('stat-a').textContent = a; $('stat-a-label').textContent = aLabel;
+  $('stat-b').textContent = b; $('stat-b-label').textContent = bLabel;
+}
+// fraction between 0 and 1 for a known amount of work, or null while the total is unknown
+function setBar(fraction){
+  const bar = $('bar');
+  bar.hidden = false;
+  bar.className = fraction === null ? 'bar busy' : 'bar';
+  $('bar-fill').style.width = fraction === null ? '' : Math.round(fraction * 100) + '%';
+}
 
 // Everything one scan collects. A fresh one is made for each attempt, so a download that fails
 // part-way never leaves half its results behind.
@@ -426,7 +455,6 @@ async function loadRepo(owner, repo, refInput, token){
 // Preferred route: the whole repository arrives as one download and is unpacked and scanned as it
 // streams in, so the number of files and the size of the repository do not matter.
 async function scanArchive(s, owner, repo, sha){
-  const prog = $('progress');
   const idle = new AbortController();
   let timer = null;
   const kick = () => { clearTimeout(timer); timer = setTimeout(() => idle.abort(), 90000); };
@@ -441,7 +469,8 @@ async function scanArchive(s, owner, repo, sha){
       transform(chunk, ctl){ got += chunk.byteLength; kick(); ctl.enqueue(chunk); }
     }));
     const decoder = new TextDecoder('utf-8');
-    const paint = () => { prog.textContent = fmtNum(s.cov.scanned) + ' files read so far, ' + (got / 1048576).toFixed(1) + ' MB downloaded'; };
+    const paint = () => setStats(fmtNum(s.cov.scanned), 'files read so far', (got / 1048576).toFixed(1) + ' MB', 'downloaded');
+    setBar(null);
     await readTarGz(counted, {
       entry: (e) => e.type === 'file' && wantFile(s, e.path, e.size),
       file: async (path, bytes) => {
@@ -478,29 +507,34 @@ async function scanTree(s, owner, repo, sha, token){
   }
   picked.sort((a, b) => a.prio - b.prio || a.size - b.size);
   log('Reading ' + fmtNum(picked.length) + ' files one at a time');
-  const prog = $('progress');
   let done = 0;
+  const paint = () => { setStats(fmtNum(done), 'files read so far', fmtNum(picked.length), 'files to read'); setBar(picked.length ? done / picked.length : 1); };
+  paint();
   await pool(picked, LIMITS.concurrency, async (c) => {
     try { scanFile(s, c.path, await fetchRaw(owner, repo, sha, c.path), c.size); }
     catch (e){
       if (net.controller.signal.aborted) return;
       s.cov.failed.push(c.path);
     }
-    done++; prog.textContent = fmtNum(done) + ' of ' + fmtNum(picked.length) + ' files read';
+    done++; paint();
   });
 }
 
 async function runScan(){
   const parsed = parseRepo($('repo').value);
   const out = $('out'); out.hidden = true; out.replaceChildren();
-  $('log').replaceChildren(); $('progress').textContent = ''; $('status').hidden = false;
+  $('log').replaceChildren(); lastLog = null;
+  $('stats').hidden = true; $('bar').hidden = true; $('scan-commit').textContent = '';
+  $('scan-name').textContent = parsed ? 'Scanning ' + parsed.owner + '/' + parsed.repo : 'Cannot start the scan';
+  document.body.className = 'app';   // switches the header from the start-page hero to the compact bar
+  $('go').textContent = 'Scan';
+  $('status').hidden = false;
   if (!parsed){ log('Enter a repository as owner/name or a github.com link.', 'err'); return; }
   const { owner, repo } = parsed;
   const token = '';            // visitors never need one: the scan service talks to GitHub for them
   const refInput = parsed.ref; // empty means the default branch
 
   const wantDeep = deepEnabled() && $('deep').checked;
-  if (wantDeep && SITE.turnstileSiteKey && !tsToken){ log('Please wait a moment for the security check to finish, then press Scan again.', 'err'); return; }
 
   net.controller = new AbortController();
   net.rate = null;
@@ -508,6 +542,7 @@ async function runScan(){
   try {
     log('Fetching repository details');
     const { meta, ownerInfo, contributors, commits, sha, ref } = await loadRepo(owner, repo, refInput, token);
+    $('scan-commit').textContent = 'commit ' + sha.slice(0, 7) + ' on ' + ref;
 
     let s = null;
     if (SITE.api && typeof DecompressionStream === 'function'){
@@ -526,7 +561,7 @@ async function runScan(){
     }
     if (net.controller.signal.aborted) throw new ScanError('Scan cancelled.');
     const { findings, deps, notes, cov, binHits } = s;
-    $('progress').textContent = fmtNum(cov.scanned) + ' files read';
+    setBar(1);
     if (cov.failed.length) notes.push(cov.failed.length + ' files could not be downloaded and were not scanned.');
 
     if (binHits.exe.length) add(findings, { rule:'BIN-EXEC', sev:'medium', title:'Compiled executables committed to the repository',
@@ -549,6 +584,8 @@ async function runScan(){
     render({ owner, repo, ref, sha, meta, ownerInfo, contributors, commits, findings, deps, cov, notes, rate:net.rate });
     if (wantDeep) await runDeep({ owner, repo, sha });
   } catch (e){
+    $('scan-name').textContent = 'The scan did not finish';
+    $('bar').hidden = true;
     log(e instanceof ScanError ? e.message : 'Something went wrong while scanning: ' + (e && e.message ? e.message : 'unknown error'), 'err');
   } finally {
     $('go').disabled = false; $('cancel').hidden = true;
@@ -567,15 +604,36 @@ function verdictFor(counts, cov, notes){
   return { cls:'clear', title:'Nothing found by this quick scan', text:'No known risky patterns were detected. That is not proof of safety: this scan cannot see code fetched later, delayed payloads or heavy obfuscation. Keep using a sandbox and approval prompts.' + tail };
 }
 
-let activeFilter = null;
+// Findings are split into three kinds so the report can be browsed by tab.
+const CATS = [['all','All findings'], ['code','Code'], ['deps','Dependencies'], ['repo','Repository']];
+function catOf(rule){
+  if (/^(?:PKG|DEP|OSV|REQ)-/.test(rule)) return 'deps';
+  if (/^(?:REPO|OWNER|BIN|SOURCEMAP)-/.test(rule) || rule === 'SECRET-FILE') return 'repo';
+  return 'code';
+}
+const VERDICT_WORD = { critical:'Critical', high:'High', medium:'Medium', clear:'Clear' };
+
+let activeFilter = null, activeCat = 'all';
 function applyFilter(){
-  document.querySelectorAll('.group').forEach((g) => { g.hidden = !!activeFilter && g.dataset.sev !== activeFilter; });
+  let shown = 0, total = 0;
+  document.querySelectorAll('#findings .group').forEach((g) => {
+    total++;
+    g.hidden = (!!activeFilter && g.dataset.sev !== activeFilter) || (activeCat !== 'all' && g.dataset.cat !== activeCat);
+    if (!g.hidden) shown++;
+  });
   document.querySelectorAll('.tile').forEach((t) => t.setAttribute('aria-pressed', String(t.dataset.sev === activeFilter)));
+  document.querySelectorAll('.tab').forEach((t) => t.setAttribute('aria-selected', String(t.dataset.cat === activeCat)));
+  const none = $('no-match');
+  if (none) none.hidden = shown > 0 || total === 0;
 }
 
 function ghFileLink(owner, repo, sha, f){
   const url = 'https://github.com/' + owner + '/' + repo + '/blob/' + sha + '/' + encPath(f.file) + (f.line ? '#L' + f.line : '');
   return h('a', { class:'loc', href:url, target:'_blank', rel:'noopener noreferrer', text: sanitize(f.file) + (f.line ? ':' + f.line : '') });
+}
+function card(title, aside, ...body){
+  return h('section', { class:'card' },
+    h('div', { class:'card-head' }, h('h2', { text:title }), aside ? h('span', { text:aside }) : null), body);
 }
 
 function render(r){
@@ -583,32 +641,43 @@ function render(r){
   const counts = Object.fromEntries(SEV.map((s) => [s, 0]));
   findings.forEach((f) => counts[f.sev]++);
   const v = verdictFor(counts, cov, notes);
-  activeFilter = null;
+  activeFilter = null; activeCat = 'all';
 
   const out = $('out'); out.replaceChildren();
-  out.append(h('div', { class:'verdict ' + v.cls, role:'status' }, h('h2', { text:v.title }), h('p', { text:v.text })));
 
-  out.append(h('div', { class:'tiles' }, SEV.map((s) =>
-    h('button', { type:'button', class:'tile ' + s, 'data-sev':s, 'aria-pressed':'false',
-      onclick:() => { activeFilter = activeFilter === s ? null : s; applyFilter(); } },
-      h('b', { text:String(counts[s]) }), h('span', { text:SEV_LABEL[s] })))));
+  // Summary: one status block, the verdict in words, and the counts (which also filter the list)
+  const warn = ['M12 3 L22 20 H2 Z', 'M12 10 V14', 'M12 17 V17.2'];
+  const tick = ['M12 3 L20 6.5 V12 C20 16.5 16.6 19.9 12 21 C7.4 19.9 4 16.5 4 12 V6.5 Z', 'M8.5 12 L11 14.5 L15.5 9.5'];
+  out.append(h('section', { class:'card summary', role:'status' },
+    h('div', { class:'summary-main' },
+      h('div', { class:'status-block ' + v.cls }, icon(v.cls === 'clear' ? tick : warn, 34),
+        h('b', { text:VERDICT_WORD[v.cls] }), h('span', { text: v.cls === 'clear' ? 'quick scan' : 'highest severity' })),
+      h('div', { class:'summary-text' },
+        h('p', { class:'where', text: owner + '/' + repo + ' · commit ' + sha.slice(0, 7) + ' on ' + r.ref }),
+        h('h1', { text:v.title }), h('p', { text:v.text })),
+      h('div', { class:'summary-actions' },
+        h('button', { type:'button', class:'primary', text:'Download JSON report', onclick:downloadReport }))),
+    h('div', { class:'tiles', 'aria-label':'Findings by severity' }, SEV.map((s) =>
+      h('button', { type:'button', class:'tile ' + s + (counts[s] ? ' has' : ''), 'data-sev':s, 'aria-pressed':'false',
+        onclick:() => { activeFilter = activeFilter === s ? null : s; applyFilter(); } },
+        h('b', { text:String(counts[s]) }), h('span', { text:SEV_LABEL[s] }))))));
 
   // Findings grouped by rule
-  out.append(h('h2', { text:'Findings' }));
-  if (!findings.length) out.append(h('p', { class:'empty', text:'No findings.' }));
   const groups = new Map();
   for (const f of findings){
-    if (!groups.has(f.rule)) groups.set(f.rule, { rule:f.rule, title:f.title, why:f.why, sev:f.sev, items:[] });
+    if (!groups.has(f.rule)) groups.set(f.rule, { rule:f.rule, title:f.title, why:f.why, sev:f.sev, cat:catOf(f.rule), items:[] });
     const g = groups.get(f.rule);
     if (SEV.indexOf(f.sev) < SEV.indexOf(g.sev)) g.sev = f.sev;
     g.items.push(f);
   }
   const ordered = [...groups.values()].sort((a, b) => SEV.indexOf(a.sev) - SEV.indexOf(b.sev) || b.items.length - a.items.length);
-  for (const g of ordered){
+  const perCat = { all:ordered.length, code:0, deps:0, repo:0 };
+  ordered.forEach((g) => perCat[g.cat]++);
+  const rows = ordered.map((g) => {
     const shown = g.items.slice(0, LIMITS.shownPerGroup);
     const list = h('ul', null, shown.map((f) => {
       if (f.files){
-        return h('li', null, h('div', { class:'loc pre-wrap', text: f.files.slice(0, 15).map(sanitize).join('\n') + (f.files.length > 15 ? '\n\u2026 and ' + (f.files.length - 15) + ' more' : '') }));
+        return h('li', null, h('div', { class:'loc pre-wrap', text: f.files.slice(0, 15).map(sanitize).join('\n') + (f.files.length > 15 ? '\n… and ' + (f.files.length - 15) + ' more' : '') }));
       }
       return h('li', null,
         f.file ? ghFileLink(owner, repo, sha, f) : null,
@@ -617,57 +686,64 @@ function render(r){
     const total = g.items.reduce((n, f) => n + (f.files ? f.files.length : 1), 0);
     const body = h('div', { class:'gbody' }, h('p', { class:'why', text:g.why }), list,
       g.items.length > shown.length ? h('p', { class:'more', text:(g.items.length - shown.length) + ' more in the JSON report.' }) : null);
-    const det = h('details', { class:'group', 'data-sev':g.sev },
+    const det = h('details', { class:'group', 'data-sev':g.sev, 'data-cat':g.cat },
       h('summary', null, h('span', { class:'badge ' + g.sev, text:SEV_LABEL[g.sev] }), h('span', { class:'t', text:g.title }),
         h('span', { class:'count', text: total + (total === 1 ? ' match' : ' matches') }), h('span', { class:'rid', text:g.rule })), body);
     if (SEV.indexOf(g.sev) <= 1) det.open = true;
-    out.append(det);
-  }
+    return det;
+  });
+  const findingsCard = h('section', { class:'card', id:'findings' },
+    h('div', { class:'tabs', role:'tablist', 'aria-label':'Finding categories' }, CATS.map(([id, label]) =>
+      h('button', { type:'button', class:'tab', role:'tab', 'data-cat':id, 'aria-selected':String(id === 'all'),
+        onclick:() => { activeCat = id; applyFilter(); } }, label, h('i', { text:String(perCat[id]) })))),
+    rows,
+    rows.length ? h('p', { class:'empty', id:'no-match', hidden:'', text:'No findings match this filter.' })
+                : h('p', { class:'empty', text:'No findings.' }));
 
   // Deep scan slot (filled by runDeep)
-  out.append(h('h2', { text:'Deep scan' }), h('div', { id:'deep-slot' }));
-  setDeepSlot([h('p', { class:'empty', text: deepEnabled() ? 'Not run. Tick “Also run the deep scan” and scan again to add Semgrep, secret detection and dependency audits.' : 'The deep scan is not enabled on this site.' })]);
-
-  // Repository facts
-  const dd = (k, val) => [h('dt', { text:k }), h('dd', { text:String(val) })];
-  out.append(h('h2', { text:'Repository' }));
-  out.append(h('div', { class:'panel flush' }, h('dl', { class:'facts' },
-    dd('Name', owner + '/' + repo),
-    dd('Scanned commit', sha + ' on ' + r.ref),
-    dd('Created', fmtDate(meta.created_at)),
-    dd('Last push', fmtDate(meta.pushed_at)),
-    dd('Stars and forks', fmtNum(meta.stargazers_count) + ' stars, ' + fmtNum(meta.forks_count) + ' forks'),
-    dd('License', meta.license && meta.license.spdx_id ? meta.license.spdx_id : 'None declared'),
-    dd('Contributors', Array.isArray(r.contributors) ? (r.contributors.length >= 30 ? '30 or more' : r.contributors.length) : 'Unknown'),
-    dd('Owner account', r.ownerInfo ? (r.ownerInfo.type + ', created ' + fmtDate(r.ownerInfo.created_at)) : 'Unknown'),
-    dd('Recent commits', r.commits.slice(0, 5).map((c) => fmtDate(c.commit.author && c.commit.author.date) + ' ' + sanitize(((c.commit.author && c.commit.author.name) || 'unknown').slice(0, 40)) + ': ' + sanitize((c.commit.message || '').split('\n')[0].slice(0, 80))).join('\n')))));
+  const deepCard = card('Deep scan', 'Run on GitHub, without executing the code', h('div', { id:'deep-slot' }));
 
   // Dependencies
+  let depsCard = null;
   if (deps.length){
-    out.append(h('h2', { text:'Dependencies' }));
-    const rows = deps.slice(0, 300).map((d) => h('tr', null,
+    const depRows = deps.slice(0, 300).map((d) => h('tr', null,
       h('td', { class:'mono', text:sanitize(d.name) }), h('td', { text:d.eco }),
       h('td', { class:'mono', text:sanitize(d.spec.slice(0, 40)) }), h('td', { text:d.dev ? 'dev' : 'runtime' }),
       h('td', null, d.vulns ? d.vulns.slice(0, 4).map((id, i) => [i ? ' ' : '', /^[A-Za-z0-9._:-]+$/.test(id) ? h('a', { href:'https://osv.dev/vulnerability/' + encodeURIComponent(id), target:'_blank', rel:'noopener noreferrer', text:id }) : h('span', { text:'?' })]) : (d.noVersion ? 'not checked (no version)' : (d.version ? 'none known' : 'not checked')))));
-    out.append(h('div', { class:'panel scroll flush' }, h('table', null,
-      h('thead', null, h('tr', null, ['Package','Ecosystem','Version','Scope','Known advisories'].map((t) => h('th', { text:t })))), h('tbody', null, rows))));
-    if (deps.length > 300) out.append(h('p', { class:'more', text:'Showing the first 300 of ' + deps.length + ' dependencies.' }));
+    depsCard = card('Dependencies', fmtNum(deps.length) + (deps.length === 1 ? ' package' : ' packages'),
+      h('div', { class:'scroll' }, h('table', null,
+        h('thead', null, h('tr', null, ['Package','Ecosystem','Version','Scope','Known advisories'].map((t) => h('th', { text:t })))), h('tbody', null, depRows))),
+      deps.length > 300 ? h('p', { class:'more card-body', text:'Showing the first 300 of ' + fmtNum(deps.length) + ' dependencies. The JSON report has them all.' }) : null);
   }
 
+  // Repository facts
+  const dd = (k, val, stack) => h('div', stack ? { class:'stack' } : null, h('dt', { text:k }), h('dd', { text:String(val) }));
+  const factsCard = card('Repository', null, h('dl', { class:'facts' },
+    dd('Name', owner + '/' + repo),
+    dd('Scanned commit', sha.slice(0, 12) + ' on ' + r.ref),
+    dd('Created', fmtDate(meta.created_at)),
+    dd('Last push', fmtDate(meta.pushed_at)),
+    dd('Stars', fmtNum(meta.stargazers_count)),
+    dd('Forks', fmtNum(meta.forks_count)),
+    dd('License', meta.license && meta.license.spdx_id ? meta.license.spdx_id : 'None declared'),
+    dd('Contributors', Array.isArray(r.contributors) ? (r.contributors.length >= 30 ? '30 or more' : r.contributors.length) : 'Unknown'),
+    dd('Owner account', r.ownerInfo ? (r.ownerInfo.type + ', created ' + fmtDate(r.ownerInfo.created_at)) : 'Unknown'),
+    dd('Recent commits', r.commits.slice(0, 5).map((c) => fmtDate(c.commit.author && c.commit.author.date) + ' ' + sanitize(((c.commit.author && c.commit.author.name) || 'unknown').slice(0, 40)) + ': ' + sanitize((c.commit.message || '').split('\n')[0].slice(0, 80))).join('\n'), true)));
+
   // Coverage
-  out.append(h('h2', { text:'Coverage' }));
-  const covList = h('ul', { class:'notes' },
+  const coverageCard = card('Coverage', null, h('ul', { class:'notes' },
     h('li', { text: fmtNum(cov.scanned) + ' of ' + fmtNum(cov.total) + ' files were read (' + fmtNum(cov.lines) + ' lines). There is no limit on the number of files or the size of the repository. ' + fmtNum(cov.unsupported) + ' files were skipped because their type is not scanned (images, lockfiles and similar).' }),
     cov.skipped.length ? h('li', { text: fmtNum(cov.skipped.length) + ' files were set aside (bundled node_modules, binary content or a single oversized file); the JSON report lists them all. Examples: ' + cov.skipped.slice(0, 4).map(sanitize).join('; ') + '.' }) : null,
     notes.map((n) => h('li', { text:n })),
     h('li', { text:'Only package.json and requirements files are parsed for dependencies in this version. Lockfiles, pyproject.toml, Cargo and Go modules are not.' }),
-    r.rate ? h('li', { text:'GitHub API requests left this hour: ' + r.rate.remaining + ' of ' + r.rate.limit + '.' }) : null);
-  out.append(covList);
+    r.rate ? h('li', { text:'GitHub API requests left this hour: ' + r.rate.remaining + ' of ' + r.rate.limit + '.' }) : null));
 
-  // Export
+  out.append(h('div', { class:'cols' },
+    h('div', { class:'col-main' }, findingsCard, deepCard, depsCard),
+    h('aside', { class:'col-side' }, factsCard, coverageCard)));
+  setDeepSlot([h('p', { class:'empty', text: deepEnabled() ? 'Not run. Tick “Include deep scan” and scan again to add Semgrep, secret detection and dependency audits.' : 'The deep scan is not enabled on this site.' })]);
+
   r.counts = counts; r.deep = null; current = r;
-  out.append(h('p', null, h('button', { type:'button', class:'ghost', text:'Download JSON report', onclick:downloadReport })));
-
   out.hidden = false;
   out.scrollIntoView({ behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block:'start' });
 }
@@ -679,7 +755,7 @@ let current = null;
 function downloadReport(){
   const r = current; if (!r) return;
   const { owner, repo, sha, findings, deps, cov, notes, counts } = r;
-  const report = { tool:'agent-audit v0.3', scannedAt:new Date().toISOString(), repository:owner + '/' + repo, commit:sha, ref:r.ref,
+  const report = { tool:'agent-audit v0.4', scannedAt:new Date().toISOString(), repository:owner + '/' + repo, commit:sha, ref:r.ref,
     summary:counts, coverage:{ filesInRepo:cov.total, filesScanned:cov.scanned, linesScanned:cov.lines, bytesScanned:cov.bytes, skipped:cov.skipped, failed:cov.failed, notes },
     findings:findings.map((f) => ({ rule:f.rule, severity:f.sev, title:f.title, file:f.file, line:f.line, snippet:f.snippet, files:f.files })),
     dependencies:deps.map((d) => ({ name:d.name, ecosystem:d.eco, spec:d.spec, version:d.version || null, scope:d.dev ? 'dev' : 'runtime', file:d.file, advisories:d.vulns || [] })),
@@ -728,6 +804,8 @@ function setupTurnstile(){
     if (!window.turnstile) return;
     tsWidget = window.turnstile.render('#ts-box', {
       sitekey: SITE.turnstileSiteKey,
+      appearance: 'interaction-only', // stays out of the way unless the visitor has to do something
+      theme: 'dark',
       callback: (t) => { tsToken = t; },
       'expired-callback': () => { tsToken = null; },
       'error-callback': () => { tsToken = null; }
@@ -754,6 +832,12 @@ async function api(path, init){
 
 async function runDeep({ owner, repo, sha }){
   try {
+    // The quick report never waits for the security check; only the deep scan needs it.
+    if (SITE.turnstileSiteKey && !tsToken){
+      deepStatus('Waiting for the security check to finish');
+      for (let i = 0; i < 30 && !tsToken; i++) await sleep(500);
+      if (!tsToken) throw new ScanError('The security check did not finish, so the deep scan was not started. Reload the page and scan again.');
+    }
     deepStatus('Starting the deep scan');
     const token = tsToken;
     resetTurnstile();
@@ -813,7 +897,7 @@ function renderDeep(report, owner, repo, sha, runUrl){
     const ok = t.ok !== false;
     const det = h('details', { class:'group' },
       h('summary', null,
-        h('span', { class:'badge ' + (ok ? (items.length ? top : 'info') : 'high'), text: ok ? (items.length ? SEV_LABEL[top] : 'Clear') : 'Error' }),
+        h('span', { class:'badge ' + (ok ? (items.length ? top : 'ok') : 'high'), text: ok ? (items.length ? SEV_LABEL[top] : 'Clear') : 'Error' }),
         h('span', { class:'t', text:TOOL_TITLES[k] }),
         h('span', { class:'count', text: ok ? items.length + (items.length === 1 ? ' finding' : ' findings') : 'incomplete' })),
       body);
