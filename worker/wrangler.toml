@@ -4,7 +4,7 @@ compatibility_date = "2025-01-01"
 
 [vars]
 # Where your scanner page lives (origin only, no path). Separate several with commas.
-ALLOWED_ORIGIN = "https://make-code-for-all.github.io/"
+ALLOWED_ORIGIN = "https://make-code-for-all.github.io"
 # The repository that holds .github/workflows/scan.yml
 SCANNER_REPO = "make-code-for-all/agent-audit"
 SCANNER_BRANCH = "main"
