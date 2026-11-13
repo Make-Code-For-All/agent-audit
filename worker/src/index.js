@@ -15,6 +15,11 @@ const REPO_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/[A-Za-z0-9_.-]{1,100}$/;
 const ID_RE = /^r[0-9a-f]{20}$/;
 const SHA_RE = /^[0-9a-f]{40}$/;
 const DAY = 86400;
+// A scan job on GitHub is cut off after 30 minutes and its report step after 10 more. A job still
+// "pending" well past that never reported back (for example its callback was rejected), so it is
+// treated as lost: visitors are told, and the next request starts a fresh scan instead of waiting on it.
+const STALE_PENDING_MS = 45 * 60 * 1000;
+const isStale = (job) => job.status === 'pending' && Date.now() - (job.createdAt || 0) > STALE_PENDING_MS;
 
 // Tune these to control cost and abuse. KV's free plan allows about 1,000 writes per day,
 // and each new scan uses about 5 of them.
@@ -277,7 +282,7 @@ async function handleScan(request, env) {
     const rawJob = await env.SCANS.get('job:' + cachedId);
     if (rawJob) {
       const job = JSON.parse(rawJob);
-      if (job.status !== 'failed') return json({ jobId: cachedId, status: job.status, repo: full, commit: sha, cached: true });
+      if (job.status !== 'failed' && !isStale(job)) return json({ jobId: cachedId, status: job.status, repo: full, commit: sha, cached: true });
     }
   }
 
@@ -311,6 +316,7 @@ async function handleResult(url, env) {
   const raw = await env.SCANS.get('job:' + id);
   if (!raw) return json({ error: 'This scan does not exist or has expired.' }, 404);
   const job = JSON.parse(raw);
+  if (isStale(job)) return json({ status: 'failed', repo: job.repo, commit: job.sha, message: 'The scan did not report back. Please scan again to start a new one.' });
   const out = { status: job.status, repo: job.repo, commit: job.sha };
   if (job.status === 'done') out.report = job.report;
   if (job.status === 'failed') out.message = job.message || 'The scan did not complete.';

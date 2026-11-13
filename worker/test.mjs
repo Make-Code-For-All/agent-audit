@@ -85,6 +85,13 @@ r=await call(`/archive/octo/secret/${SHA}`); ok(r.status===404,'archive private 
 r=await call('/archive/octo/hello/main'); ok(r.status===400,'archive needs a full commit');
 r=await call(`/archive/octo/../${SHA}`); ok(r.status===400||r.status===404,'archive rejects dot-dot');
 r=await call(`/archive/octo/hello/${SHA}`,{headers:{Origin:'https://evil.example'}}); ok(r.status===403,'archive other origin');
+// a pending job that never reported back is abandoned after 45 minutes
+store.clear(); dispatched=[]; globalThis.fetch=orig;
+r=await scan({repo:'octo/hello'},'5.5.5.5'); j=await r.json(); const lostId=j.jobId;
+r=await scan({repo:'octo/hello'},'5.5.5.6'); j=await r.json(); ok(j.jobId===lostId&&j.cached&&dispatched.length===1,'fresh pending job is joined');
+const lost=JSON.parse(store.get('job:'+lostId)); lost.createdAt=Date.now()-46*60*1000; store.set('job:'+lostId,JSON.stringify(lost));
+r=await call('/result/'+lostId); j=await r.json(); ok(j.status==='failed'&&/scan again/.test(j.message),'stale pending job reads as failed');
+r=await scan({repo:'octo/hello'},'5.5.5.7'); j=await r.json(); ok(j.jobId!==lostId&&!j.cached&&dispatched.length===2,'stale pending job is replaced by a new scan');
 console.log(`${pass} passed, ${fail} failed`);
 
 process.exit(fail?1:0);
