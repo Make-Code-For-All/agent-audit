@@ -520,15 +520,38 @@ async function scanTree(s, owner, repo, sha, token){
   });
 }
 
-async function runScan(){
-  const parsed = parseRepo($('repo').value);
+// Clears the previous report and shows the progress card. Shared by repository and upload scans.
+function beginScan(title){
   const out = $('out'); out.hidden = true; out.replaceChildren();
   $('log').replaceChildren(); lastLog = null;
   $('stats').hidden = true; $('bar').hidden = true; $('scan-commit').textContent = '';
-  $('scan-name').textContent = parsed ? 'Scanning ' + parsed.owner + '/' + parsed.repo : 'Cannot start the scan';
+  $('scan-name').textContent = title;
   document.body.className = 'app';   // switches the header from the start-page hero to the compact bar
   $('go').textContent = 'Scan';
   $('status').hidden = false;
+}
+function setBusy(busy){
+  for (const id of ['go', 'pick-files', 'pick-folder']) $(id).disabled = busy;
+  $('cancel').hidden = !busy;
+}
+// Findings about files that are present but cannot be read as source.
+function fileSignals(s, local){
+  const { findings, binHits } = s;
+  const where = local ? 'included in the upload' : 'committed to the repository';
+  if (binHits.exe.length) add(findings, { rule:'BIN-EXEC', sev:'medium', title:'Compiled executables ' + where,
+    why:'Binaries cannot be reviewed as source. Prefer ' + (local ? 'projects' : 'repositories') + ' that build from source, or verify these files separately.', snippet:'', files:binHits.exe });
+  if (binHits.other.length) add(findings, { rule:'BIN-OTHER', sev:'low', title:'Archives or bytecode ' + where,
+    why:'These can contain code that is not visible in the scan.', snippet:'', files:binHits.other });
+  if (binHits.maps.length) add(findings, { rule:'SOURCEMAP-COMMITTED', sev:'low', title:'Source maps ' + where,
+    why:'Source maps publish the original source of the built app, and have exposed hidden keys and internal logic in the past. Remove them from production builds.', snippet:'', files:binHits.maps });
+  if (binHits.secret.length) add(findings, { rule:'SECRET-FILE', sev:'medium', title: local ? 'Sensitive-looking files included in the upload' : 'Sensitive-looking files committed',
+    why: local ? 'Key files and .env files usually hold secrets. Make sure they are not published or shared along with this code.'
+               : 'Key files and .env files in a repository are either leaked secrets or a sign of careless handling.', snippet:'', files:binHits.secret });
+}
+
+async function runScan(){
+  const parsed = parseRepo($('repo').value);
+  beginScan(parsed ? 'Scanning ' + parsed.owner + '/' + parsed.repo : 'Cannot start the scan');
   if (!parsed){ log('Enter a repository as owner/name or a github.com link.', 'err'); return; }
   const { owner, repo } = parsed;
   const token = '';            // visitors never need one: the scan service talks to GitHub for them
@@ -538,7 +561,7 @@ async function runScan(){
 
   net.controller = new AbortController();
   net.rate = null;
-  $('go').disabled = true; $('cancel').hidden = false;
+  setBusy(true);
   try {
     log('Fetching repository details');
     const { meta, ownerInfo, contributors, commits, sha, ref } = await loadRepo(owner, repo, refInput, token);
@@ -560,18 +583,11 @@ async function runScan(){
       await scanTree(s, owner, repo, sha, token);
     }
     if (net.controller.signal.aborted) throw new ScanError('Scan cancelled.');
-    const { findings, deps, notes, cov, binHits } = s;
+    const { findings, deps, notes, cov } = s;
     setBar(1);
     if (cov.failed.length) notes.push(cov.failed.length + ' files could not be downloaded and were not scanned.');
 
-    if (binHits.exe.length) add(findings, { rule:'BIN-EXEC', sev:'medium', title:'Compiled executables committed to the repository',
-      why:'Binaries cannot be reviewed as source. Prefer repositories that build from source, or verify these files separately.', snippet:'', files:binHits.exe });
-    if (binHits.other.length) add(findings, { rule:'BIN-OTHER', sev:'low', title:'Archives or bytecode committed to the repository',
-      why:'These can contain code that is not visible in the scan.', snippet:'', files:binHits.other });
-    if (binHits.maps.length) add(findings, { rule:'SOURCEMAP-COMMITTED', sev:'low', title:'Source maps committed to the repository',
-      why:'Source maps publish the original source of the built app, and have exposed hidden keys and internal logic in the past. Remove them from production builds.', snippet:'', files:binHits.maps });
-    if (binHits.secret.length) add(findings, { rule:'SECRET-FILE', sev:'medium', title:'Sensitive-looking files committed',
-      why:'Key files and .env files in a repository are either leaked secrets or a sign of careless handling.', snippet:'', files:binHits.secret });
+    fileSignals(s, false);
 
     if (deps.length){
       log('Checking ' + fmtNum(deps.length) + ' dependencies against OSV.dev');
@@ -588,17 +604,182 @@ async function runScan(){
     $('bar').hidden = true;
     log(e instanceof ScanError ? e.message : 'Something went wrong while scanning: ' + (e && e.message ? e.message : 'unknown error'), 'err');
   } finally {
-    $('go').disabled = false; $('cancel').hidden = true;
+    setBusy(false);
   }
+}
+
+/* ============================================================
+   Upload scan: files, folders and archives chosen from the visitor's
+   device. Everything is read inside the browser. The files are never
+   sent anywhere; only dependency names and versions go to OSV.dev.
+   ============================================================ */
+const ARCHIVE_NAME = /\.(?:zip|tar|tgz|tar\.gz)$/i;
+const cancelled = () => !!(net.controller && net.controller.signal.aborted);
+// The single folder that every path sits inside ("project/"), or '' when there is none.
+function commonTop(paths){
+  let top = null;
+  for (const p of paths){
+    const i = p.indexOf('/');
+    if (i < 0) return '';
+    const t = p.slice(0, i + 1);
+    if (top === null) top = t; else if (top !== t) return '';
+  }
+  return top || '';
+}
+
+// items: [{ file: File, path: 'folder/name.ext' }]
+async function runUpload(items){
+  items = items.filter((it) => it && it.file && it.path);
+  if (!items.length || $('go').disabled) return;
+  // An archive is unpacked when it was chosen directly, not when it merely sits inside an uploaded folder.
+  const archives = items.filter((it) => !it.path.includes('/') && ARCHIVE_NAME.test(it.path));
+  const loose = items.filter((it) => !archives.includes(it));
+  const looseTop = commonTop(loose.map((it) => it.path));
+  const single = archives.length === 1 && !loose.length;
+  const name = single ? archives[0].path : looseTop ? looseTop.slice(0, -1) : items.length === 1 ? items[0].path : fmtNum(items.length) + ' files';
+  const kind = single ? 'Archive' : (looseTop ? 'Folder' : loose.length === 1 ? 'File' : loose.length ? 'Files' : 'Archives')
+    + (archives.length && loose.length ? ' and ' + archives.length + (archives.length === 1 ? ' archive' : ' archives') : '');
+
+  beginScan('Scanning ' + sanitize(name));
+  $('scan-commit').textContent = 'read in your browser, never uploaded';
+  net.controller = new AbortController();
+  net.rate = null;
+  setBusy(true);
+  try {
+    const s = newScan();
+    const decoder = new TextDecoder('utf-8');
+    let gitFiles = 0, lastYield = performance.now();
+    const paint = () => setStats(fmtNum(s.cov.scanned), 'files read so far', fmtNum(s.cov.total), 'files seen');
+    const stop = () => { if (cancelled()) throw new ScanError('Scan cancelled.'); };
+    const breathe = async () => { // let the page repaint and stay responsive
+      if (performance.now() - lastYield < 40) return;
+      paint();
+      await new Promise((r) => setTimeout(r, 0));
+      lastYield = performance.now();
+      stop();
+    };
+    const want = (path, size) => {
+      if (/(?:^|\/)\.git\//.test(path)){ gitFiles++; return false; }
+      return wantFile(s, path, size);
+    };
+    const read = (path, bytes) => scanFile(s, path, decoder.decode(bytes), bytes.length);
+    setBar(null);
+
+    if (loose.length){
+      log('Reading ' + fmtNum(loose.length) + (loose.length === 1 ? ' file' : ' files') + ' (as text; nothing is executed or uploaded)');
+      for (const it of loose){
+        const path = it.path.slice(looseTop.length);
+        if (want(path, it.file.size)){
+          try { read(path, new Uint8Array(await it.file.arrayBuffer())); }
+          catch (e){ s.cov.failed.push(path); }
+        }
+        await breathe();
+      }
+    }
+
+    for (const a of archives){
+      const prefix = single ? '' : a.path + '/';
+      log('Unpacking ' + sanitize(a.path) + ' in your browser (nothing is executed or uploaded)');
+      try {
+        if (typeof DecompressionStream !== 'function') throw new Error('this browser cannot unpack archives; upload the unpacked folder instead');
+        if (/\.zip$/i.test(a.path)){
+          const entries = (await listZip(a.file)).filter((e) => e.type === 'file');
+          const top = commonTop(entries.map((e) => e.path));
+          for (const e of entries){
+            const path = prefix + e.path.slice(top.length);
+            if (want(path, e.size)){
+              if (e.encrypted) s.cov.skipped.push(path + ' (password-protected)');
+              else {
+                try { read(path, await readZipEntry(a.file, e, LIMITS.fileBytes)); }
+                catch (err){ s.cov.failed.push(path); }
+              }
+            }
+            await breathe();
+          }
+        } else {
+          const gzip = !/\.tar$/i.test(a.path);
+          // First pass only looks at the names, to find a top-level folder shared by everything.
+          let top = null;
+          try {
+            await readTarGz(a.file.stream(), { gzip, keepTop:true, entry:(e) => {
+              stop();
+              if (e.type === 'file' && top !== ''){ const t = commonTop([e.path]); top = top === null || top === t ? t : ''; }
+              return false;
+            } });
+          } catch (err){ if (err instanceof ScanError) throw err; /* the second pass reports a damaged archive */ }
+          top = top || '';
+          await readTarGz(a.file.stream(), { gzip, keepTop:true,
+            entry:(e) => { stop(); return e.type === 'file' && want(prefix + e.path.slice(top.length), e.size); },
+            file: async (p, bytes) => { read(prefix + p.slice(top.length), bytes); await breathe(); } });
+        }
+      } catch (err){
+        if (err instanceof ScanError) throw err;
+        s.notes.push('The archive ' + sanitize(a.path) + ' could not be read completely, so some or all of its files were not scanned. Reason: ' + sanitize(String(err && err.message ? err.message : 'unknown error').slice(0, 160)));
+      }
+    }
+    stop();
+    paint(); setBar(1);
+    // Nothing read at all must never look like a clean result.
+    if (!s.cov.total) throw new ScanError(s.notes[0] || 'There were no files to scan in that upload.');
+
+    const { findings, deps, notes, cov } = s;
+    if (cov.failed.length) notes.push(cov.failed.length + ' files could not be read and were not scanned.');
+    if (gitFiles) notes.push(fmtNum(gitFiles) + ' files inside .git folders (Git’s own history data) were left out.');
+    fileSignals(s, true);
+    if (deps.length){
+      log('Checking ' + fmtNum(deps.length) + ' dependencies against OSV.dev (only package names and versions are sent)');
+      typosquat(deps, findings);
+      await osvLookup(deps, findings, notes);
+    }
+    log('Done');
+    $('status').hidden = true;
+    render({ local:{ name, kind, items:items.length, bytes:items.reduce((n, it) => n + it.file.size, 0) }, findings, deps, cov, notes, rate:null });
+  } catch (e){
+    $('scan-name').textContent = 'The scan did not finish';
+    $('bar').hidden = true;
+    log(e instanceof ScanError ? e.message : 'Something went wrong while scanning: ' + (e && e.message ? e.message : 'unknown error'), 'err');
+  } finally {
+    setBusy(false);
+  }
+}
+
+// Files and folders dropped on the page. Folders are walked here because a drop only hands over their top level.
+async function droppedItems(dt){
+  const roots = [];
+  for (const it of Array.from(dt.items || [])){
+    if (it.kind !== 'file') continue;
+    const entry = typeof it.webkitGetAsEntry === 'function' ? it.webkitGetAsEntry() : null;
+    if (entry) roots.push(entry);
+    else { const f = it.getAsFile(); if (f) roots.push(f); }
+  }
+  if (!roots.length) return Array.from(dt.files || []).map((f) => ({ file:f, path:f.name }));
+  const out = [];
+  const walk = async (entry) => {
+    if (entry instanceof File){ out.push({ file:entry, path:entry.name }); return; }
+    if (entry.isFile){
+      const file = await new Promise((res) => entry.file(res, () => res(null)));
+      if (file) out.push({ file, path:entry.fullPath.replace(/^\/+/, '') });
+    } else if (entry.isDirectory){
+      if (/^(?:\.git|node_modules)$/.test(entry.name)) return; // never scanned, and often tens of thousands of files
+      const reader = entry.createReader();
+      for (;;){ // a folder is handed over in batches until an empty one arrives
+        const batch = await new Promise((res) => reader.readEntries(res, () => res([])));
+        if (!batch.length) break;
+        for (const child of batch) await walk(child);
+      }
+    }
+  };
+  for (const r of roots) await walk(r);
+  return out;
 }
 
 /* ============================================================
    Rendering (all untrusted text goes through textContent)
    ============================================================ */
-function verdictFor(counts, cov, notes){
+function verdictFor(counts, cov, notes, local){
   const partial = cov.skipped.length > 0 || cov.failed.length > 0 || notes.length > 0;
   const tail = partial ? ' Some files or checks were skipped, see Coverage below.' : '';
-  if (counts.critical) return { cls:'critical', title:'Do not run this', text:'Critical indicators were found, such as malware signatures or reverse-shell code. Review the findings before doing anything with this repository.' + tail };
+  if (counts.critical) return { cls:'critical', title:'Do not run this', text:'Critical indicators were found, such as malware signatures or reverse-shell code. Review the findings before doing anything with ' + (local ? 'these files' : 'this repository') + '.' + tail };
   if (counts.high) return { cls:'high', title:'High-risk patterns found', text:'Do not run this outside a sandbox until you have read the high-severity findings and confirmed they are legitimate.' + tail };
   if (counts.medium) return { cls:'medium', title:'Several items need a closer look', text:'Nothing alarming on its own, but review the medium findings and run it only in an isolated environment with throwaway credentials.' + tail };
   return { cls:'clear', title:'Nothing found by this quick scan', text:'No known risky patterns were detected. That is not proof of safety: this scan cannot see code fetched later, delayed payloads or heavy obfuscation. Keep using a sandbox and approval prompts.' + tail };
@@ -627,6 +808,11 @@ function applyFilter(){
   if (none) none.hidden = shown > 0 || total === 0;
 }
 
+// Where a finding is. Uploaded files have no web address, so they are shown as plain text.
+function fileRef(r, f){
+  if (r.local) return h('span', { class:'loc', text: sanitize(f.file) + (f.line ? ':' + f.line : '') });
+  return ghFileLink(r.owner, r.repo, r.sha, f);
+}
 function ghFileLink(owner, repo, sha, f){
   const url = 'https://github.com/' + owner + '/' + repo + '/blob/' + sha + '/' + encPath(f.file) + (f.line ? '#L' + f.line : '');
   return h('a', { class:'loc', href:url, target:'_blank', rel:'noopener noreferrer', text: sanitize(f.file) + (f.line ? ':' + f.line : '') });
@@ -637,10 +823,10 @@ function card(title, aside, ...body){
 }
 
 function render(r){
-  const { owner, repo, sha, findings, deps, cov, notes, meta } = r;
+  const { owner, repo, sha, findings, deps, cov, notes, meta, local } = r;
   const counts = Object.fromEntries(SEV.map((s) => [s, 0]));
   findings.forEach((f) => counts[f.sev]++);
-  const v = verdictFor(counts, cov, notes);
+  const v = verdictFor(counts, cov, notes, !!local);
   activeFilter = null; activeCat = 'all';
 
   const out = $('out'); out.replaceChildren();
@@ -653,7 +839,7 @@ function render(r){
       h('div', { class:'status-block ' + v.cls }, icon(v.cls === 'clear' ? tick : warn, 34),
         h('b', { text:VERDICT_WORD[v.cls] }), h('span', { text: v.cls === 'clear' ? 'quick scan' : 'highest severity' })),
       h('div', { class:'summary-text' },
-        h('p', { class:'where', text: owner + '/' + repo + ' · commit ' + sha.slice(0, 7) + ' on ' + r.ref }),
+        h('p', { class:'where', text: local ? sanitize(local.name) + ' · uploaded from this device' : owner + '/' + repo + ' · commit ' + sha.slice(0, 7) + ' on ' + r.ref }),
         h('h1', { text:v.title }), h('p', { text:v.text })),
       h('div', { class:'summary-actions' },
         h('button', { type:'button', class:'primary', text:'Download JSON report', onclick:downloadReport }))),
@@ -680,7 +866,7 @@ function render(r){
         return h('li', null, h('div', { class:'loc pre-wrap', text: f.files.slice(0, 15).map(sanitize).join('\n') + (f.files.length > 15 ? '\n… and ' + (f.files.length - 15) + ' more' : '') }));
       }
       return h('li', null,
-        f.file ? ghFileLink(owner, repo, sha, f) : null,
+        f.file ? fileRef(r, f) : null,
         f.snippet ? h('pre', { class:'snip', text:f.snippet }) : null);
     }));
     const total = g.items.reduce((n, f) => n + (f.files ? f.files.length : 1), 0);
@@ -701,7 +887,7 @@ function render(r){
                 : h('p', { class:'empty', text:'No findings.' }));
 
   // Deep scan slot (filled by runDeep)
-  const deepCard = card('Deep scan', 'Run on GitHub, without executing the code', h('div', { id:'deep-slot' }));
+  const deepCard = card('Deep scan', local ? 'Repository links only' : 'Run on GitHub, without executing the code', h('div', { id:'deep-slot' }));
 
   // Dependencies
   let depsCard = null;
@@ -718,7 +904,14 @@ function render(r){
 
   // Repository facts
   const dd = (k, val, stack) => h('div', stack ? { class:'stack' } : null, h('dt', { text:k }), h('dd', { text:String(val) }));
-  const factsCard = card('Repository', null, h('dl', { class:'facts' },
+  const factsCard = local ? card('Upload', null, h('dl', { class:'facts' },
+    dd('Name', sanitize(local.name)),
+    dd('Source', local.kind + ', read in your browser'),
+    dd('Items chosen', fmtNum(local.items)),
+    dd('Size on disk', local.bytes < 1048576 ? Math.max(1, Math.round(local.bytes / 1024)) + ' KB' : (local.bytes / 1048576).toFixed(1) + ' MB'),
+    dd('Files seen', fmtNum(cov.total)),
+    dd('Scanned', new Date().toISOString().slice(0, 16).replace('T', ' ') + ' UTC')))
+    : card('Repository', null, h('dl', { class:'facts' },
     dd('Name', owner + '/' + repo),
     dd('Scanned commit', sha.slice(0, 12) + ' on ' + r.ref),
     dd('Created', fmtDate(meta.created_at)),
@@ -732,16 +925,17 @@ function render(r){
 
   // Coverage
   const coverageCard = card('Coverage', null, h('ul', { class:'notes' },
-    h('li', { text: fmtNum(cov.scanned) + ' of ' + fmtNum(cov.total) + ' files were read (' + fmtNum(cov.lines) + ' lines). There is no limit on the number of files or the size of the repository. ' + fmtNum(cov.unsupported) + ' files were skipped because their type is not scanned (images, lockfiles and similar).' }),
+    h('li', { text: fmtNum(cov.scanned) + ' of ' + fmtNum(cov.total) + ' files were read (' + fmtNum(cov.lines) + ' lines). There is no limit on the number of files or the size of the ' + (local ? 'upload' : 'repository') + '. ' + fmtNum(cov.unsupported) + ' files were skipped because their type is not scanned (images, lockfiles and similar).' }),
     cov.skipped.length ? h('li', { text: fmtNum(cov.skipped.length) + ' files were set aside (bundled node_modules, binary content or a single oversized file); the JSON report lists them all. Examples: ' + cov.skipped.slice(0, 4).map(sanitize).join('; ') + '.' }) : null,
     notes.map((n) => h('li', { text:n })),
+    local ? h('li', { text:'Uploaded files stay in your browser. Repository signals (age, stars, owner account) and the deep scan need a GitHub link, so they are not part of this report.' }) : null,
     h('li', { text:'Only package.json and requirements files are parsed for dependencies in this version. Lockfiles, pyproject.toml, Cargo and Go modules are not.' }),
     r.rate ? h('li', { text:'GitHub API requests left this hour: ' + r.rate.remaining + ' of ' + r.rate.limit + '.' }) : null));
 
   out.append(h('div', { class:'cols' },
     h('div', { class:'col-main' }, findingsCard, deepCard, depsCard),
     h('aside', { class:'col-side' }, factsCard, coverageCard)));
-  setDeepSlot([h('p', { class:'empty', text: deepEnabled() ? 'Not run. Tick “Include deep scan” and scan again to add Semgrep, secret detection and dependency audits.' : 'The deep scan is not enabled on this site.' })]);
+  setDeepSlot([h('p', { class:'empty', text: local ? 'The deep scan runs on GitHub\u2019s servers, so it is only available when you scan a repository link. Uploaded files never leave your browser.' : deepEnabled() ? 'Not run. Tick “Include deep scan” and scan again to add Semgrep, secret detection and dependency audits.' : 'The deep scan is not enabled on this site.' })]);
 
   r.counts = counts; r.deep = null; current = r;
   out.hidden = false;
@@ -755,14 +949,17 @@ let current = null;
 function downloadReport(){
   const r = current; if (!r) return;
   const { owner, repo, sha, findings, deps, cov, notes, counts } = r;
-  const report = { tool:'agent-audit v0.4', scannedAt:new Date().toISOString(), repository:owner + '/' + repo, commit:sha, ref:r.ref,
+  const slug = r.local ? 'upload-' + (r.local.name.replace(/[^\w.-]+/g, '-').slice(0, 60) || 'files') : owner + '-' + repo;
+  const target = r.local ? { source:'upload', upload:{ name:r.local.name, kind:r.local.kind, items:r.local.items, bytes:r.local.bytes } }
+                         : { source:'github', repository:owner + '/' + repo, commit:sha, ref:r.ref };
+  const report = { tool:'agent-audit v0.5', scannedAt:new Date().toISOString(), ...target,
     summary:counts, coverage:{ filesInRepo:cov.total, filesScanned:cov.scanned, linesScanned:cov.lines, bytesScanned:cov.bytes, skipped:cov.skipped, failed:cov.failed, notes },
     findings:findings.map((f) => ({ rule:f.rule, severity:f.sev, title:f.title, file:f.file, line:f.line, snippet:f.snippet, files:f.files })),
     dependencies:deps.map((d) => ({ name:d.name, ecosystem:d.eco, spec:d.spec, version:d.version || null, scope:d.dev ? 'dev' : 'runtime', file:d.file, advisories:d.vulns || [] })),
     deepScan:r.deep };
   const blob = new Blob([JSON.stringify(report, null, 2)], { type:'application/json' });
   const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob); a.download = 'agent-audit-' + owner + '-' + repo + '.json';
+  a.href = URL.createObjectURL(blob); a.download = 'agent-audit-' + slug + '.json';
   document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 2000);
 }
 
@@ -913,6 +1110,29 @@ function renderDeep(report, owner, repo, sha, runUrl){
    ============================================================ */
 $('scan-form').addEventListener('submit', (e) => { e.preventDefault(); if (!$('go').disabled) runScan(); });
 $('cancel').addEventListener('click', () => { if (net.controller) net.controller.abort(); });
+
+// Uploads: two buttons that open the browser's file and folder pickers, and drag-and-drop anywhere on the page.
+for (const [button, input] of [['pick-files', 'file-input'], ['pick-folder', 'folder-input']]){
+  $(button).addEventListener('click', () => $(input).click());
+  $(input).addEventListener('change', () => {
+    const items = Array.from($(input).files || []).map((f) => ({ file:f, path:f.webkitRelativePath || f.name }));
+    $(input).value = ''; // so choosing the same file again starts a new scan
+    runUpload(items);
+  });
+}
+if (!('webkitdirectory' in $('folder-input'))) $('pick-folder').hidden = true; // some mobile browsers cannot pick folders
+const dragsFiles = (e) => !!e.dataTransfer && Array.from(e.dataTransfer.types || []).includes('Files');
+let dragDepth = 0;
+window.addEventListener('dragenter', (e) => { if (!dragsFiles(e)) return; e.preventDefault(); dragDepth++; document.body.classList.add('drop'); });
+window.addEventListener('dragover', (e) => { if (dragsFiles(e)) e.preventDefault(); });
+window.addEventListener('dragleave', (e) => { if (!dragsFiles(e)) return; if (--dragDepth <= 0){ dragDepth = 0; document.body.classList.remove('drop'); } });
+window.addEventListener('drop', (e) => {
+  if (!dragsFiles(e)) return;
+  e.preventDefault(); // without this the browser would open the dropped file itself
+  dragDepth = 0; document.body.classList.remove('drop');
+  if ($('go').disabled) return;
+  droppedItems(e.dataTransfer).then(runUpload);
+});
 try {
   const q = new URLSearchParams(location.search).get('repo');
   if (q && q.length < 200) $('repo').value = q;

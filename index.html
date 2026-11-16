@@ -17,7 +17,7 @@
     </a>
     <div class="hero">
       <h1>Scan a GitHub repository before your AI agent runs it</h1>
-      <p class="lede">Paste a public repository link. Every file is read, nothing is executed, and you get a report of risky code, suspicious dependencies and repository red flags.</p>
+      <p class="lede">Paste a public repository link, or upload code from your device. Every file is read, nothing is executed, and you get a report of risky code, suspicious dependencies and repository red flags.</p>
       <form id="scan-form" autocomplete="off">
         <label class="sr" for="repo">Repository link</label>
         <div class="field">
@@ -27,6 +27,13 @@
         <button class="primary" type="submit" id="go">Scan repository</button>
         <button class="ghost" type="button" id="cancel" hidden>Cancel</button>
       </form>
+      <div class="upload">
+        <span>or scan files from this device</span>
+        <button class="ghost" type="button" id="pick-files">Upload files or archive</button>
+        <button class="ghost" type="button" id="pick-folder">Upload folder</button>
+        <input type="file" id="file-input" multiple hidden>
+        <input type="file" id="folder-input" webkitdirectory hidden>
+      </div>
       <div class="options">
         <label class="check" for="deep" id="deep-row" hidden>
           <input type="checkbox" id="deep" checked>
@@ -34,7 +41,7 @@
         </label>
         <div id="ts-box"></div>
       </div>
-      <p class="hint">Free. Public repositories of any size. No sign-in. To scan one branch, paste the branch link (github.com/owner/name/tree/branch).</p>
+      <p class="hint">Free. Public repositories of any size. No sign-in. To scan one branch, paste the branch link (github.com/owner/name/tree/branch).<br>Uploads can be files, a folder, or a .zip, .tar.gz or .tar archive. You can also drop them anywhere on this page. They are read in your browser and never leave your device.</p>
     </div>
     <nav>
       <a href="./#checks">What it checks</a>
@@ -84,8 +91,8 @@
     <section class="card how">
       <div class="steps">
         <h2>How it works</h2>
-        <div class="step"><span class="n">1</span><div><b>Paste a link</b><p>Any public GitHub repository, or a link to one branch.</p></div></div>
-        <div class="step"><span class="n">2</span><div><b>The whole repository is read</b><p>Downloaded once through this site’s scan service and analysed in your browser. Everything in it is treated as hostile text: shown as plain text, never executed.</p></div></div>
+        <div class="step"><span class="n">1</span><div><b>Paste a link or upload files</b><p>Any public GitHub repository, or a link to one branch. Or choose files, a folder or an archive from your device.</p></div></div>
+        <div class="step"><span class="n">2</span><div><b>The whole repository is read</b><p>Downloaded once through this site’s scan service and analysed in your browser. Uploaded files are read straight from your device and are never sent anywhere. Everything is treated as hostile text: shown as plain text, never executed.</p></div></div>
         <div class="step"><span class="n">3</span><div><b>Read the report</b><p>Findings grouped by severity, with the file and line for each. The optional deep scan adds Semgrep, secret detection and dependency audits, run on GitHub’s servers; its results are kept for 24 hours and then deleted.</p></div></div>
       </div>
       <div class="caution">
@@ -106,6 +113,7 @@
 <script src="config.js"></script>
 <script src="rules.js"></script>
 <script src="tar.js"></script>
+<script src="zip.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

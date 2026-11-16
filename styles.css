@@ -46,6 +46,10 @@ button.primary:hover{background:var(--brand-dark)}
 button.primary:disabled{background:var(--navy-line);color:var(--on-navy);cursor:not-allowed}
 #scan-form button{flex:1 0 auto;min-height:56px;font-size:16px;padding:0 28px}
 .top button.ghost{background:transparent;color:#ffffff;border-color:var(--navy-line)}
+.upload{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center;justify-content:center;font-size:14px;color:var(--on-navy)}
+.top button.ghost:hover{background:rgba(255,255,255,.08)}
+.top button.ghost:disabled{color:var(--on-navy);cursor:not-allowed;background:transparent}
+body.drop::after{content:"Drop to scan. Files are read in your browser and never uploaded.";position:fixed;inset:12px;z-index:10;display:flex;align-items:center;justify-content:center;padding:24px;text-align:center;border:3px dashed #ffffff;border-radius:12px;background:rgba(11,31,58,.88);color:#ffffff;font-size:20px;font-weight:600;pointer-events:none}
 .options{display:flex;flex-wrap:wrap;gap:10px 24px;align-items:center;justify-content:center}
 label.check{display:flex;gap:8px;align-items:center;min-height:44px;cursor:pointer;font-size:14px;color:#ffffff}
 label.check input{width:18px;height:18px;margin:0;accent-color:var(--brand);flex:none}
@@ -58,7 +62,9 @@ body.app #scan-form{max-width:none;margin-top:0}
 body.app .field{min-height:44px}
 body.app .field input{font-size:14px}
 body.app #scan-form button{min-height:44px;font-size:14px;padding:0 20px}
-body.app .options{justify-content:flex-start}
+body.app .options,body.app .upload{justify-content:flex-start}
+body.app .upload{font-size:13px;margin-top:4px}
+body.app .upload button{min-height:32px;font-size:13px;padding:0 12px}
 body.app label.check{min-height:32px;font-size:13px}
 body.app .top nav{order:3;margin-left:0}
 body.app #home{display:none}

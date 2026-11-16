@@ -20,6 +20,16 @@ Agent Audit is a free web page that reads a public GitHub repository and reports
 
 > **A clean result is not proof of safety.** The scan cannot see code that is downloaded after install, payloads that activate later, or heavily obfuscated logic. Keep using a sandbox and approval prompts.
 
+### Scanning files from your device
+
+Instead of a link, click **Upload files or archive** or **Upload folder**, or drop files anywhere on the page. You can scan:
+
+- one or more individual files,
+- a whole folder,
+- a `.zip`, `.tar.gz` / `.tgz` or `.tar` archive (for example GitHub's "Download ZIP").
+
+Uploads are read and unpacked **inside your browser** and are never sent to any server. The only network request is the dependency lookup, which sends package names and versions to OSV.dev. `.git` and `node_modules` folders are left out, and password-protected zip entries cannot be read. Repository signals and the deep scan need a GitHub link, so they are not part of an upload report.
+
 ## What it checks
 
 | Area | Examples |
@@ -58,6 +68,8 @@ Agent Audit is a free web page that reads a public GitHub repository and reports
 | `rules.js` | Detection rules, popular-package lists for typosquat checks, and file-type groups. **Edit this file to add or tune rules.** |
 | `app.js` | Scanner logic, the GitHub, OSV and Worker calls, and report rendering |
 | `tar.js` | Streaming `.tar.gz` reader, so repositories of any size are read without loading them fully into memory |
+| `zip.js` | `.zip` reader for uploaded archives; reads one entry at a time and refuses entries that unpack beyond their declared size |
+| `tests/archive.test.mjs` | Tests for the zip and tar readers |
 | `worker/` | Cloudflare Worker (`agent-audit-api`) that proxies GitHub, starts deep scans and stores results |
 | `worker/test.mjs` | Tests for the Worker, with GitHub and KV mocked |
 | `scripts/deep_scan.py` | The deep scan, run by GitHub Actions |
@@ -79,6 +91,12 @@ Run the Worker tests (Node 18+):
 
 ```bash
 cd worker && node test.mjs
+```
+
+Run the archive reader tests (Node 20.12+):
+
+```bash
+node tests/archive.test.mjs
 ```
 
 ## Deploying your own copy

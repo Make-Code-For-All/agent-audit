@@ -8,10 +8,14 @@
                         'file', 'dir', 'link' or 'other'. Return true to receive the file's contents.
      file(path, bytes)  called with the contents (a Uint8Array) of each file that entry() accepted.
    })
-   Paths have the archive's top-level folder (GitHub adds "repo-commit/") removed. */
+   Paths have the archive's top-level folder (GitHub adds "repo-commit/") removed.
+
+   Two optional settings, used for archives chosen from the visitor's device:
+     gzip: false     the stream is a plain .tar, not a .tar.gz
+     keepTop: true   keep paths exactly as stored (only a leading "./" or "/" is dropped) */
 
 async function readTarGz(stream, handlers){
-  const reader = stream.pipeThrough(new DecompressionStream('gzip')).getReader();
+  const reader = (handlers.gzip === false ? stream : stream.pipeThrough(new DecompressionStream('gzip'))).getReader();
   const utf8 = new TextDecoder('utf-8');
   let buf = new Uint8Array(0), pos = 0;
 
@@ -62,6 +66,7 @@ async function readTarGz(stream, handlers){
     }
     return out;
   };
+  const MAX_HEADER = 1024 * 1024;
   const stripTop = (p) => { const i = p.indexOf('/'); return i < 0 ? '' : p.slice(i + 1); };
 
   let override = {};
@@ -74,6 +79,8 @@ async function readTarGz(stream, handlers){
       const pad = () => take((512 - (size % 512)) % 512, false);
 
       if (flag === 'x' || flag === 'L' || flag === 'K' || flag === 'g'){
+        // Real headers are a few hundred bytes. An oversized one is skipped rather than held in memory.
+        if (size > MAX_HEADER){ await take(size, false); await pad(); continue; }
         const data = await take(size, true);
         await pad();
         if (flag === 'x'){ const p = parsePax(data); if (p.path) override.path = p.path; if (p.size) override.size = parseInt(p.size, 10); }
@@ -88,7 +95,7 @@ async function readTarGz(stream, handlers){
       override = {};
 
       const type = (flag === '0' || flag === '7') ? 'file' : flag === '5' ? 'dir' : (flag === '1' || flag === '2') ? 'link' : 'other';
-      const path = stripTop(name).replace(/\/+$/, '');
+      const path = (handlers.keepTop ? name.replace(/^(?:\.?\/)+/, '') : stripTop(name)).replace(/\/+$/, '');
       const wanted = path ? handlers.entry({ path, size, type }) : false;
       if (type === 'file' && wanted){
         const bytes = await take(size, true);
